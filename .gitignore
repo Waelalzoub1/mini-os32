@@ -1,0 +1,11 @@
+build/
+fs/cc
+fs/shell
+fs/vbeprobe
+tools/cc_host
+*.o
+*.elf
+*.bin
+*.img
+*.vdi
+*.pad
