@@ -1,0 +1,600 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mini-os32 Reference</title>
+<style>
+  :root {
+    --paper: #f6f7f8;
+    --ink: #1b1f23;
+    --muted: #5a6470;
+    --accent: #0b7285;
+    --accent-soft: #0b728514;
+    --code-bg: #14171a;
+    --code-ink: #e8ebee;
+    --inline-bg: #e9edf0;
+    --line: #d8dde2;
+    --warn-bg: #fdf3e0;
+    --warn-edge: #d9930d;
+    --mark: #ffe28a;
+    --sig: #0b4f5c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #121417;
+      --ink: #e2e6ea;
+      --muted: #97a1ac;
+      --accent: #5bc8d5;
+      --accent-soft: #5bc8d51a;
+      --code-bg: #0a0c0e;
+      --code-ink: #dde2e6;
+      --inline-bg: #21262c;
+      --line: #2a3037;
+      --warn-bg: #2a2313;
+      --warn-edge: #d9a23c;
+      --mark: #6b5a11;
+      --sig: #8fd8e2;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #121417; --ink: #e2e6ea; --muted: #97a1ac; --accent: #5bc8d5;
+    --accent-soft: #5bc8d51a; --code-bg: #0a0c0e; --code-ink: #dde2e6;
+    --inline-bg: #21262c; --line: #2a3037; --warn-bg: #2a2313;
+    --warn-edge: #d9a23c; --mark: #6b5a11; --sig: #8fd8e2;
+  }
+  :root[data-theme="light"] {
+    --paper: #f6f7f8; --ink: #1b1f23; --muted: #5a6470; --accent: #0b7285;
+    --accent-soft: #0b728514; --code-bg: #14171a; --code-ink: #e8ebee;
+    --inline-bg: #e9edf0; --line: #d8dde2; --warn-bg: #fdf3e0;
+    --warn-edge: #d9930d; --mark: #ffe28a; --sig: #0b4f5c;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  code, pre, .sig, .search input, nav a, h2, .hits {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  .wrap { display: flex; max-width: 1120px; margin: 0 auto; }
+
+  nav {
+    width: 220px; flex: none;
+    position: sticky; top: 0; align-self: flex-start;
+    max-height: 100vh; overflow-y: auto;
+    padding: 84px 8px 24px 20px;
+  }
+  nav a {
+    display: block; text-decoration: none; color: var(--muted);
+    font-size: 12.5px; padding: 4px 10px; border-left: 2px solid var(--line);
+  }
+  nav a:hover, nav a:focus-visible { color: var(--accent); border-left-color: var(--accent); }
+
+  main { flex: 1; min-width: 0; padding: 0 32px 96px 32px; max-width: 760px; }
+
+  .search {
+    position: sticky; top: 0; z-index: 5;
+    background: var(--paper);
+    padding: 16px 0 12px 0;
+    border-bottom: 1px solid var(--line);
+    display: flex; gap: 12px; align-items: baseline;
+  }
+  .search input {
+    flex: 1; font-size: 15px; padding: 8px 12px;
+    color: var(--ink); background: var(--inline-bg);
+    border: 1px solid var(--line); border-radius: 4px;
+  }
+  .search input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .hits { font-size: 12px; color: var(--muted); white-space: nowrap; }
+
+  header.title { margin: 28px 0 4px 0; }
+  header.title h1 { font-size: 26px; margin: 0; letter-spacing: -0.01em; }
+  header.title p { margin: 4px 0 0 0; color: var(--muted); font-size: 14.5px; }
+
+  h2 {
+    font-size: 13.5px; text-transform: uppercase; letter-spacing: 0.14em;
+    color: var(--accent); margin: 56px 0 8px 0;
+    padding-bottom: 6px; border-bottom: 1px solid var(--line);
+    text-wrap: balance;
+  }
+  h3 { font-size: 17px; margin: 28px 0 6px 0; }
+  p { margin: 8px 0; }
+  section > p, .entry p { max-width: 68ch; }
+  ul { margin: 6px 0; padding-left: 22px; }
+  li { margin: 3px 0; max-width: 65ch; }
+  a { color: var(--accent); }
+
+  .entry { padding: 10px 0 4px 0; }
+  .sig {
+    display: inline-block;
+    font-size: 14px; font-weight: 600; color: var(--sig);
+    background: var(--accent-soft);
+    padding: 3px 8px; border-radius: 4px;
+  }
+  .entry > p { margin-top: 6px; }
+
+  pre {
+    background: var(--code-bg); color: var(--code-ink);
+    font-size: 13.5px; line-height: 1.55;
+    padding: 14px 16px; border-radius: 6px;
+    overflow-x: auto; margin: 10px 0;
+  }
+  code {
+    background: var(--inline-bg);
+    padding: 1px 5px; border-radius: 3px; font-size: 0.88em;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+
+  .gotcha {
+    background: var(--warn-bg);
+    border-left: 3px solid var(--warn-edge);
+    padding: 10px 14px; border-radius: 0 4px 4px 0; margin: 12px 0;
+    max-width: 68ch;
+  }
+  .gotcha strong { color: var(--warn-edge); }
+
+  table { border-collapse: collapse; font-size: 14px; margin: 10px 0; }
+  th, td { text-align: left; padding: 5px 14px 5px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+  td:first-child { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; white-space: nowrap; }
+  td { font-variant-numeric: tabular-nums; }
+  .tablewrap { overflow-x: auto; }
+
+  mark { background: var(--mark); color: inherit; border-radius: 2px; }
+
+  .kbd {
+    font-family: ui-monospace, Menlo, monospace; font-size: 0.85em;
+    border: 1px solid var(--line); border-bottom-width: 2px;
+    padding: 0 5px; border-radius: 4px; background: var(--inline-bg);
+  }
+
+  @media (max-width: 800px) {
+    nav { display: none; }
+    main { padding: 0 18px 64px 18px; }
+  }
+</style>
+
+<div class="wrap">
+<nav aria-label="Sections">
+  <a href="#start">Getting started</a>
+  <a href="#shell">Shell</a>
+  <a href="#lang">The language</a>
+  <a href="#cpp">Preprocessor</a>
+  <a href="#lib">Library</a>
+  <a href="#sys">Syscalls</a>
+  <a href="#gfx">Graphics</a>
+  <a href="#hwx">Hardware</a>
+  <a href="#fsx">Files &amp; persistence</a>
+  <a href="#crash">Reading a crash</a>
+  <a href="#limits">Limits</a>
+  <a href="#traps">Trap list</a>
+</nav>
+
+<main>
+<div class="search">
+  <input id="q" type="search" placeholder="search everything… ( / to focus, Esc to clear )" aria-label="Search reference">
+  <span class="hits" id="hits"></span>
+</div>
+
+<header class="title">
+  <h1>mini-os32 reference</h1>
+  <p>The language, the library, every syscall, graphics, and hardware access — one page, one search box.</p>
+</header>
+
+<section id="start">
+<h2>Getting started</h2>
+<div class="entry" data-k="build boot qemu run-uefi kvm">
+<p><b>Build and boot</b> from the repo root. <code>-b</code> rebuilds first, <code>-k</code> uses KVM (fast), <code>-p</code> boots the real image so writes persist across runs. Without <code>-p</code> you boot a scratch copy (<code>build/run-uefi.img</code>; the previous copy is kept as <code>.prev</code>).</p>
+<pre>./run-uefi.sh -k -b</pre>
+</div>
+<div class="entry" data-k="compile cc source files output workflow">
+<p><b>Compile and run</b> inside the OS. <code>cc</code> prompts for a space-separated source list, then an output name. <code>lib/stdio.c</code> is added automatically; every other library source (<code>string.c</code>, <code>stdlib.c</code>, <code>gfx.c</code>) must be listed — bare names are found in <code>/lib</code> automatically.</p>
+<pre>cc
+source files: game.c gfx.c
+output file:  game
+
+run game</pre>
+</div>
+<div class="entry" data-k="edit editor keys ctrl-s save sync">
+<p><b>Editor:</b> <code>edit file.c</code>. <span class="kbd">Ctrl+S</span> saves <i>and syncs to the persistent store</i> (status shows <code>saved+synced</code>). <span class="kbd">Ctrl+U</span>/<span class="kbd">Ctrl+D</span> page up/down. Arrow keys move; exit returns to the shell.</p>
+</div>
+<div class="entry" data-k="scrollback history shift pgup pgdn console">
+<p><b>Console scrollback:</b> <span class="kbd">Shift+PgUp</span> / <span class="kbd">Shift+PgDn</span> page through the last 512 lines. Any new output snaps back to live.</p>
+</div>
+</section>
+
+<section id="shell">
+<h2>Shell commands</h2>
+<div class="tablewrap"><table>
+<tr><th>command</th><th>what it does</th></tr>
+<tr><td>ls</td><td>list current directory — directories first, three columns</td></tr>
+<tr><td>cd d / cd ..</td><td>change directory (persists across <code>run</code>)</td></tr>
+<tr><td>type f</td><td>print a file (<code>type doc/gfx.txt</code> + Shift+PgUp to read guides)</td></tr>
+<tr><td>edit f</td><td>open the editor</td></tr>
+<tr><td>run f</td><td>execute a program — it <b>replaces</b> the shell; a fresh shell returns when it exits</td></tr>
+<tr><td>cc / as</td><td>the C compiler / the x86-32 AT&amp;T assembler</td></tr>
+<tr><td>mv, rm, mkdir, rmdir</td><td>the usual — a directory must be empty to remove</td></tr>
+<tr><td>sync</td><td>flush the RAM disk to the persistent store</td></tr>
+<tr><td>shutdown</td><td>ACPI power-off (alias <code>poweroff</code>)</td></tr>
+<tr><td>vbeprobe</td><td>list supported 8-bpp VBE modes (BIOS boot only)</td></tr>
+</table></div>
+<div class="entry" data-k="ctrl-c kill program interrupt">
+<p><span class="kbd">Ctrl+C</span> kills the running program and returns to the shell.</p>
+</div>
+</section>
+
+<section id="lang">
+<h2>The language</h2>
+<p>cc is a real C compiler for a consistent subset. What's listed here works; what isn't listed probably doesn't.</p>
+
+<div class="entry" data-k="types int unsigned short long char float bool void pointer array struct enum union typedef const static extern volatile">
+<span class="sig">types</span>
+<p><code>int</code>, <code>unsigned int</code>, <code>short</code>/<code>unsigned short</code> (real 16-bit), <code>long</code> (= int, ILP32), <code>char</code> (signed/unsigned), <code>float</code>, <code>bool</code>/<code>_Bool</code>, <code>void</code>, pointers, arrays (multi-dimensional work), function pointers, <code>struct</code>/<code>union</code>/<code>enum</code>/<code>typedef</code>; <code>static</code>, <code>extern</code>, <code>const</code>, <code>volatile</code>. There is <b>no double</b> — <code>float</code> is the only floating type (~7 significant digits).</p>
+</div>
+
+<div class="entry" data-k="literals hex escape string char suffix exponent">
+<span class="sig">literals</span>
+<p>Decimal and hex ints (<code>123</code>, <code>0x7B</code>) with <code>u/U/l/L</code> suffixes; floats with exponents (<code>1.5e3</code>) and <code>f</code> suffix; chars <code>'a'</code>, <code>'\n'</code>; strings; escapes <code>\n \t \r \a \b \f \v \e \\ \' \" \?</code>, hex <code>\x41</code>, octal <code>\101</code>. Unknown escapes warn.</p>
+</div>
+
+<div class="entry" data-k="operators arithmetic bitwise comparison logical shift assignment increment decrement sizeof ternary">
+<span class="sig">operators</span>
+<p>All the usual: <code>+ - * / %</code>, <code>&amp; | ^ ~ &lt;&lt; &gt;&gt;</code>, comparisons, short-circuit <code>&amp;&amp; || !</code>, <code>?:</code>, compound assignment, <code>++/--</code> (prefix and postfix), <code>&amp; *</code>, <code>. -&gt;</code>, <code>sizeof</code>.</p>
+<div class="gotcha"><strong>Gotchas.</strong> <code>++/--</code> desugar to <code>x = x + 1</code>, so the lvalue is evaluated twice — <code>a[f()]++</code> calls <code>f()</code> twice. Function arguments evaluate <b>right to left</b>: <code>printf("%d %d", i++, i)</code> will surprise you.</div>
+</div>
+
+<div class="entry" data-k="statements if else while do for switch case break continue return goto label declarations">
+<span class="sig">statements</span>
+<p><code>if/else</code>, <code>while</code>, <code>do…while</code>, <code>for</code> (with a declaration in the init clause), <code>switch/case/default</code>, <code>break</code>, <code>continue</code>, <code>return</code>, <code>goto</code> (forward and back; undefined labels are errors). Declarations are allowed inside blocks.</p>
+</div>
+
+<div class="entry" data-k="functions parameters varargs va_start va_arg va_end call by value">
+<span class="sig">functions</span>
+<p>Up to 16 parameters, call by value. Varargs via <code>va_start/va_arg/va_end</code> (builtins; include <code>stdarg.h</code> for the <code>va_list</code> typedef).</p>
+</div>
+
+<div class="entry" data-k="structs assignment pass by value return struct unsupported">
+<span class="sig">structs</span>
+<p>Field access, <code>sizeof</code>, struct <b>assignment</b> and <b>pass-by-value</b> all work (the callee gets a copy). <b>Returning a struct by value is rejected</b> (<code>ret struct unsupported</code>) — return a pointer or fill an out-parameter instead.</p>
+</div>
+
+<div class="entry" data-k="initialisers braces nested arrays partial zero fill brace elision">
+<span class="sig">initialisers</span>
+<p>Braced initialisers for arrays and structs, nested; length inference (<code>int a[] = {…}</code>, <code>char s[] = "…"</code>); partial initialisers zero-fill. Locals may use non-constant expressions; globals must be constant. <b>No brace elision:</b> <code>int m[2][2] = {{1,2},{3,4}}</code>, never <code>{1,2,3,4}</code>.</p>
+</div>
+</section>
+
+<section id="cpp">
+<h2>Preprocessor</h2>
+<div class="entry" data-k="include search order quotes angle brackets lib">
+<span class="sig">#include</span>
+<p><code>"file.h"</code> searches: the including file's directory → the working directory → the root → <code>/lib</code>. <code>&lt;file.h&gt;</code> searches: the root → <code>/lib</code>. So <code>&lt;stdio.h&gt;</code> works from anywhere. Depth limit 9.</p>
+</div>
+<div class="entry" data-k="define macro function-like undef if ifdef ifndef elif else endif line file">
+<span class="sig">#define &amp; friends</span>
+<p><code>#define NAME value</code>, function-like macros up to 8 params, <code>#undef</code>, <code>#if/#ifdef/#ifndef/#elif/#else/#endif</code>, <code>__LINE__</code>, <code>__FILE__</code>. No <code>##</code> or stringizing <code>#</code>. 256 macros max, 256-char bodies.</p>
+<div class="gotcha"><strong>Line-based.</strong> The preprocessor reads one line at a time. Never <i>open</i> a <code>/* … */</code> comment on a directive line and continue it below — the continuation lines get parsed as code. Put multi-line comments above the directive.</div>
+</div>
+</section>
+
+<section id="lib">
+<h2>Library</h2>
+<p>Everything lives in <code>/lib</code>. Headers give prototypes; the <code>.c</code> file must be in your source list (except stdio, which is automatic).</p>
+
+<div class="entry" data-k="stdio printf puts putc readline scanf snprintf formats float">
+<span class="sig">stdio — automatic</span>
+<p><code>putc, puts, readline, printf, snprintf, vsnprintf, scanf</code>. <b><code>puts</code> does not append a newline.</b> printf formats: <code>%d %u %x %X %c %s %f %g %%</code> with precision (<code>%.2f</code>). scanf: <code>%d %u %x %c %s %f %e %g</code>, reads one line per call, returns items assigned — check it. Floats are 32-bit: ~7 digits, <code>%f</code> switches to scientific outside 1e-4…1e9.</p>
+</div>
+<div class="entry" data-k="string memcpy memset memmove memcmp strlen strcmp strncmp strcpy strncpy">
+<span class="sig">string.c — &lt;string.h&gt;</span>
+<p><code>memcpy, memset, memmove, memcmp, strlen, strcmp, strncmp, strcpy, strncpy</code>.</p>
+</div>
+<div class="entry" data-k="stdlib malloc free calloc realloc atoi strtol heap">
+<span class="sig">stdlib.c — &lt;stdlib.h&gt;</span>
+<p><code>malloc, free, calloc, realloc, atoi, strtol</code>. The heap grows via <code>sys_sbrk</code> toward the stack.</p>
+</div>
+<div class="entry" data-k="errno ENOMEM EINVAL">
+<span class="sig">errno.h</span>
+<p><code>extern int errno</code>; codes <code>ENOMEM</code> (12), <code>EINVAL</code> (22).</p>
+</div>
+<div class="entry" data-k="stdint int8 uint8 int16 uint16 int32 uint32">
+<span class="sig">stdint.h</span>
+<p><code>int8_t/uint8_t, int16_t/uint16_t, int32_t/uint32_t</code>.</p>
+</div>
+<div class="entry" data-k="path cwd resolve path_fs path_dir path_base relative">
+<span class="sig">path.c — &lt;path.h&gt;</span>
+<p><code>cwd_get()</code>, <code>path_resolve(base, name, out, sz)</code> (joins and folds <code>.</code>/<code>..</code>), <code>path_fs</code> (same + rejects names over the 47-char limit), <code>path_dir</code>, <code>path_base</code>. Needed only if your program takes relative paths itself.</p>
+</div>
+</section>
+
+<section id="sys">
+<h2>Syscalls</h2>
+<p>Call through the wrappers below (declared in <code>stdio.h</code> — they are cc builtins, no extra source needed) or raw with <code>syscall(n, …)</code>. Numbers live in <code>lib/libc.h</code>.</p>
+
+<h3>Files</h3>
+<div class="entry" data-k="sys_load read file whole bytes -1 missing">
+<span class="sig">int sys_load(char *name, void *buf, int max)</span>
+<p>Reads a whole file into <code>buf</code>. Returns the size, or <b>-1</b> if the file doesn't exist <i>or is larger than max</i>. -1 on a first run is normal — treat it as "no data yet".</p>
+</div>
+<div class="entry" data-k="sys_save write file whole replace create">
+<span class="sig">int sys_save(char *name, void *buf, int size)</span>
+<p>Creates or completely replaces a file with <code>size</code> bytes from <code>buf</code>. Returns 0 on success. The pattern is always load → modify in memory → save; there is no append.</p>
+</div>
+<div class="entry" data-k="sys_open sys_fread sys_fwrite sys_close sys_seek file descriptor streaming">
+<span class="sig">sys_open / sys_fread / sys_fwrite / sys_close / sys_seek</span>
+<p>Descriptor-based streaming I/O for files too big to hold in memory: <code>sys_open(name, mode)</code> (0 read, 1 write) returns an fd; then <code>sys_fread(fd, buf, len)</code>, <code>sys_fwrite</code>, <code>sys_seek(fd, pos)</code>, <code>sys_close(fd)</code>.</p>
+</div>
+<div class="entry" data-k="sys_list directory entries 52 bytes names">
+<span class="sig">int sys_list(void *buf, int max)</span>
+<p>Fills <code>buf</code> with 52-byte records — 48 bytes of name, 4 bytes of size — and returns the count. Directory markers end in <code>/</code>. Size the buffer for 512 entries: <code>52*512</code>.</p>
+</div>
+<div class="entry" data-k="sys_rename sys_delete remove">
+<span class="sig">sys_rename(old, new) / sys_delete(name)</span>
+<p>Rename or delete. 0 on success.</p>
+</div>
+<div class="entry" data-k="sys_getcwd sys_setcwd working directory shared kernel">
+<span class="sig">sys_getcwd(buf, max) / sys_setcwd(path)</span>
+<p>The kernel-held working directory. The shell publishes it on <code>cd</code> and re-reads it on restart, which is why your cwd survives <code>run</code>.</p>
+</div>
+<div class="entry" data-k="sys_sync flush store persistent">
+<span class="sig">int sys_sync(void)</span>
+<p>Flushes the whole RAM disk to the persistent store. 0 on success, nonzero when no store is attached. The editor calls this on every Ctrl+S.</p>
+</div>
+
+<h3>Console &amp; keys</h3>
+<div class="entry" data-k="sys_write sys_read stdout stdin fd 1 0">
+<span class="sig">sys_write(fd, buf, len) / sys_read(fd, buf, len)</span>
+<p>fd 1 = screen, fd 0 = keyboard line input. <code>printf</code>/<code>readline</code> sit on top of these.</p>
+</div>
+<div class="entry" data-k="sys_getkey sys_getkey_nb blocking nonblocking ascii escape 27">
+<span class="sig">sys_getkey() / sys_getkey_nb()</span>
+<p>One keypress: blocking / non-blocking (0 when nothing waits). Returns ASCII; arrows are 0x100–0x103, Delete 0x104, Escape is 27.</p>
+</div>
+<div class="entry" data-k="sys_keystate held key scancode SC_ arrows wasd game input">
+<span class="sig">int sys_keystate(int sc)</span>
+<p>1 while the key is physically held. The right choice for movement — several keys can be down at once, no repeat delay. Scancodes in stdio.h: <code>SC_UP SC_DOWN SC_LEFT SC_RIGHT SC_W SC_A SC_S SC_D SC_Q SC_E</code>.</p>
+</div>
+<div class="entry" data-k="sys_cls clear screen sys_setcursor position">
+<span class="sig">sys_cls() / sys_setcursor(x, y)</span>
+<p>Clear the text console / move the cursor.</p>
+</div>
+
+<h3>Process, time, memory</h3>
+<div class="entry" data-k="sys_exec run program replace process">
+<span class="sig">int sys_exec(name)</span>
+<p>Replaces the current program with another (this is what <code>run</code> uses). There is only ever one process.</p>
+</div>
+<div class="entry" data-k="sys_exit code terminate">
+<span class="sig">void sys_exit(code)</span>
+<p>Ends the program; the shell restarts. <code>main</code> returning does this for you.</p>
+</div>
+<div class="entry" data-k="sys_ticks milliseconds since boot timing dt">
+<span class="sig">int sys_ticks(void)</span>
+<p>Milliseconds since boot. Measure frame time with it instead of assuming a fixed delay.</p>
+</div>
+<div class="entry" data-k="sys_sleep sys_sleepf ms yield cpu">
+<span class="sig">sys_sleep(ms) / sys_sleepf(ms)</span>
+<p>Give up the CPU. <code>sys_sleepf</code> is the frame-friendly variant for render loops.</p>
+</div>
+<div class="entry" data-k="sys_sbrk heap grow malloc">
+<span class="sig">void *sys_sbrk(inc)</span>
+<p>Grows the heap by <code>inc</code> bytes, returns the old break. malloc uses this; you rarely call it directly.</p>
+</div>
+<div class="entry" data-k="sys_thread_create sys_thread_exit threads stack">
+<span class="sig">sys_thread_create(entry, stack) / sys_thread_exit()</span>
+<p>A second thread of execution inside your program, with a stack you provide.</p>
+</div>
+<div class="entry" data-k="sys_meminfo sys_storage sys_poweroff ram nvme info">
+<span class="sig">sys_meminfo / sys_storage / sys_poweroff</span>
+<p>RAM totals (see <code>hw/mem.c</code>), NVMe + store info (see <code>hw/storage.c</code>), ACPI power-off.</p>
+</div>
+</section>
+
+<section id="gfx">
+<h2>Graphics</h2>
+<p>Compile with <code>gfx.c</code> in your source list. Full worked guide: <code>type doc/gfx.txt</code>; longer example: <code>demo/move.c</code>.</p>
+
+<div class="entry" data-k="gfx_fbinfo framebuffer direct pitch bpp user_addr map">
+<span class="sig">int gfx_fbinfo(gfx_fbinfo_t *out)</span>
+<p>The way to draw: maps the framebuffer into your program. Fills <code>w, h</code> (pixels), <code>pitch</code> (<b>bytes per row</b>), <code>bpp</code> (8 or 32), <code>size</code>, <code>user_addr</code> (cast it to <code>char *</code> and write pixels). Returns &lt;0 if no framebuffer.</p>
+<div class="gotcha"><strong>The pitch trap.</strong> A row is <code>pitch</code> bytes, not <code>w</code> and not <code>w*4</code>. Compute offsets as <code>y * pitch + x * 4</code> (32-bpp) or <code>y * pitch + x</code> (8-bpp), or your image shears diagonally.</div>
+</div>
+
+<div class="entry" data-k="pixels 32bpp 8bpp put pixel bgr palette rows fast">
+<span class="sig">writing pixels</span>
+<pre>/* 32-bpp: 4 bytes, order blue-green-red-unused */
+void put32(char *fb, int pitch, int x, int y, int rgb) {
+    int off = y * pitch + x * 4;
+    fb[off + 0] = (char)(rgb &amp; 0xFF);          /* blue  */
+    fb[off + 1] = (char)((rgb &gt;&gt; 8) &amp; 0xFF);   /* green */
+    fb[off + 2] = (char)((rgb &gt;&gt; 16) &amp; 0xFF);  /* red   */
+}
+/* fill rows with an int pointer -- 4 bytes per store */
+int *row = (int *)(fb + y * pitch);
+for (int x = 0; x &lt; w; x++) row[x] = rgb;</pre>
+<p>Always clip: writing outside <code>w/h</code> corrupts the next row or faults. In 8-bpp a pixel is one palette index — set every index you use with <code>gfx_set_palette(idx, r, g, b)</code> (0–255 each); nothing is set up by default.</p>
+</div>
+
+<div class="entry" data-k="gfx_mode text 320x200 640x480 1440x900 modes uefi restore">
+<span class="sig">int gfx_mode(int mode)</span>
+<p><code>GFX_MODE_TEXT</code> (back to the shell — <b>always call this before returning</b>), <code>GFX_MODE_320x200x256</code>, <code>GFX_MODE_640x480x256</code>, <code>GFX_MODE_1440x900x32</code>. On UEFI boots the firmware fixed the mode — a change may fail silently, so call <code>gfx_fbinfo</code> afterwards and use what it reports.</p>
+</div>
+
+<div class="entry" data-k="gfx_blit buffer 8bpp push">
+<span class="sig">int gfx_blit(char *buf)</span>
+<p>Pushes your own whole-screen buffer (8-bpp modes only). Simpler than direct drawing, slower.</p>
+</div>
+
+<div class="entry" data-k="game loop timing dt frame 60fps">
+<span class="sig">the game loop</span>
+<pre>int last = sys_ticks();
+while (running) {
+    int now = sys_ticks();
+    int dt  = now - last;          /* ms since last frame */
+    last = now;
+    x = x + vx * dt / 1000;        /* speed in pixels/second */
+    draw();
+    sys_sleep(16);                 /* ~60 fps */
+}</pre>
+<p>Erase and redraw only what moved — clearing the whole screen every frame is slow, and reading the framebuffer back is far slower than writing it. Keep your own copy of anything you need to read.</p>
+</div>
+</section>
+
+<section id="hwx">
+<h2>Hardware access</h2>
+<p>Direct hardware from user space, so drivers can be written in-OS. Friendly wrappers in <code>hw/hw.c</code> + <code>hw/hw.h</code> (add <code>hw/hw.c</code> to your source list); <code>hw/lspci.c</code> is a worked example. <code>hw/hwtest.c</code> (<code>cd hw</code>, <code>cc hwtest.c hw.c</code>, <code>run hwtest</code>) self-tests every syscall in this section against the NVMe controller, PASS/FAIL per check.</p>
+
+<div class="entry" data-k="inb outb inw outw inl outl port io sys_io_in sys_io_out">
+<span class="sig">inb/inw/inl(port) — outb/outw/outl(port, v)</span>
+<p>Port I/O, 1/2/4 bytes. (Raw form: <code>sys_io_in(port, width)</code>, <code>sys_io_out(port, width, value)</code>.)</p>
+</div>
+<div class="entry" data-k="pci_read pci_write config space bus dev fn vendor device class bar sys_pci_read">
+<span class="sig">pci_read(bus, dev, fn, off) / pci_write(…, val)</span>
+<p>PCI configuration space, one dword at a time. Offset 0 is <code>device&lt;&lt;16 | vendor</code>; offset 8 has the class code in the top 24 bits; BARs start at 0x10. Absent devices read 0xFFFFFFFF. (Raw form packs <code>bus&lt;&lt;16|dev&lt;&lt;8|fn</code> into one arg.)</p>
+</div>
+<div class="entry" data-k="sys_map_phys mmio bar registers uncached map physical">
+<span class="sig">int sys_map_phys(phys_lo, phys_hi, size)</span>
+<p>Maps physical device registers (e.g. a PCI BAR — possibly above 4 GB, hence two halves) into your address space, uncached. Returns a pointer, -1 on failure. Up to 16 MB per program.</p>
+</div>
+<div class="entry" data-k="sys_dma_alloc contiguous physical descriptor rings">
+<span class="sig">int sys_dma_alloc(size, unsigned out[2])</span>
+<p>Physically contiguous memory for DMA: fills <code>out[0]</code> with your pointer and <code>out[1]</code> with the physical address the device must be programmed with. No free — it lives until the program exits.</p>
+</div>
+<div class="entry" data-k="sys_irq_wait interrupt unmask timeout count">
+<span class="sig">int sys_irq_wait(irq, timeout_ms)</span>
+<p>Unmasks IRQ 0–15 and sleeps until it fires. Returns how many times it fired, 0 on timeout.</p>
+</div>
+</section>
+
+<section id="fsx">
+<h2>Files &amp; persistence</h2>
+<div class="entry" data-k="flat filesystem directories prefixes 47 chars names limit">
+<p>The filesystem is <b>flat</b>: <code>lib/stdio.c</code> is one literal key, a "directory" is a name prefix (marked by a zero-size entry ending in <code>/</code>), and whole names cap at <b>47 characters</b> including the prefix. Names are stored uppercase but matched case-insensitively.</p>
+</div>
+<div class="entry" data-k="layout lib hw demo doc src root">
+<div class="tablewrap"><table>
+<tr><th>dir</th><th>contents</th></tr>
+<tr><td>/lib</td><td>the C library — all headers and sources</td></tr>
+<tr><td>/hw</td><td>hardware: hw.c/h wrappers, lspci.c, mem.c, storage.c, hwtest.c</td></tr>
+<tr><td>/demo</td><td>move.c (graphics), hello.s (assembly)</td></tr>
+<tr><td>/doc</td><td>gfx.txt — the graphics guide</td></tr>
+<tr><td>/src</td><td>cc.c — the compiler compiles itself: <code>src/cc.c string.c path.c</code></td></tr>
+</table></div>
+</div>
+<div class="entry" data-k="persistence ram disk sync store nvme power loss recover lsstore">
+<p><b>Where your data actually is:</b> saves go to a RAM disk. <code>sync</code> (or the editor's Ctrl+S) copies the whole RAM disk to the store partition, which survives power-off. In QEMU without <code>-p</code> the store lives in the scratch image — recover files from any image with <code>python3 tools/lsstore.py &lt;img&gt; --extract dir/</code> on the host. Files in the repo's <code>fs/</code> directory are baked into every build and are the safest home for source you care about.</p>
+</div>
+</section>
+
+<section id="crash">
+<h2>Reading a crash</h2>
+<div class="entry" data-k="user exc fault dump exception eip esp eax edx cr2 gp page fault">
+<pre>USER EXC 0000000E ERR 00000004 EIP 00006171 ESP 017FFF78 EAX 00000001 EDX 00000028 CR2 584C030B</pre>
+<p>Your program did something illegal; the kernel printed the CPU state and killed it. How to read it:</p>
+<div class="tablewrap"><table>
+<tr><th>field</th><th>meaning</th></tr>
+<tr><td>EXC 0E</td><td><b>page fault</b> — touched an unmapped address. CR2 holds <i>which address</i>: that's your bad pointer.</td></tr>
+<tr><td>EXC 0D</td><td><b>general protection</b> — an address outside the 96 MB segment, or garbage executed as code.</td></tr>
+<tr><td>EXC 00 / 06</td><td>divide by zero / invalid instruction (often a wild jump landed in data).</td></tr>
+<tr><td>EIP</td><td>the address of the faulting instruction, inside your program's code.</td></tr>
+<tr><td>ESP</td><td>the stack pointer. The stack starts at 0x1800000 and grows down — ESP near that means shallow calls (in or near main); much lower means deep recursion.</td></tr>
+<tr><td>EAX, EDX</td><td>register contents at the moment of death — often a recognizable value: a size you passed, a loop index, string bytes.</td></tr>
+<tr><td>CR2</td><td>page faults only: the exact address that was touched.</td></tr>
+</table></div>
+<p>Usual suspects, in order: an uninitialized pointer, an array index past the end, a string that lost its NUL, using a value <i>as</i> a pointer (CR2 that looks like ASCII bytes = you dereferenced text).</p>
+</div>
+</section>
+
+<section id="limits">
+<h2>Limits</h2>
+<div class="tablewrap"><table>
+<tr><th>thing</th><th>limit</th></tr>
+<tr><td>objects per build</td><td>6 — start stub + stdio + your files</td></tr>
+<tr><td>source file size</td><td>256 KB (preprocessed: 384 KB)</td></tr>
+<tr><td>line length</td><td>~1535 chars (line-based preprocessor)</td></tr>
+<tr><td>identifiers</td><td>31 chars</td></tr>
+<tr><td>function parameters</td><td>16</td></tr>
+<tr><td>struct fields</td><td>64</td></tr>
+<tr><td>filenames</td><td>47 chars, prefix included</td></tr>
+<tr><td>files</td><td>512</td></tr>
+<tr><td>code per object</td><td>384 KB</td></tr>
+<tr><td>rodata / data</td><td>96 KB / 32 KB</td></tr>
+<tr><td>bss</td><td>20 MB (whole program tops out near 23 MB with the stack)</td></tr>
+<tr><td>output binary</td><td>1 MB — the largest ELF the kernel loads</td></tr>
+<tr><td>stack</td><td>1 MB, guard page below it</td></tr>
+</table></div>
+<p>Sized so cc compiles itself: <code>src/cc.c string.c path.c</code> reproduces the compiler in-OS, byte-identical.</p>
+</section>
+
+<section id="traps">
+<h2>Trap list — things that will bite you</h2>
+<div class="entry" data-k="gotchas traps common mistakes bite">
+<ul>
+<li><b>Declaring ≠ initializing.</b> <code>int tries;</code> holds garbage until you assign it. Always <code>= 0</code>.</li>
+<li><b><code>puts</code> adds no newline.</b> End with <code>\n</code> yourself.</li>
+<li><b>Arguments evaluate right to left.</b> Don't put side effects in two arguments of one call.</li>
+<li><b><code>a[f()]++</code> calls <code>f()</code> twice.</b></li>
+<li><b>No struct return.</b> Out-parameters instead.</li>
+<li><b>Comments must not open on a <code>#define</code> line</b> and continue below it.</li>
+<li><b>Use <code>pitch</code>, never <code>w</code>,</b> for framebuffer rows.</li>
+<li><b>Restore text mode</b> (<code>gfx_mode(GFX_MODE_TEXT)</code>) before returning from a graphics program — otherwise the shell is alive but invisible.</li>
+<li><b><code>scanf</code> returns the count assigned</b> — check it; unmatched arguments keep their old values.</li>
+<li><b><code>sys_load</code> returns -1 for missing <i>or too-big</i> files.</b> Both look the same.</li>
+<li><b>Saved ≠ persistent.</b> RAM disk until <code>sync</code>; editor Ctrl+S syncs for you.</li>
+<li><b>Names cap at 47 chars including the directory.</b></li>
+</ul>
+</div>
+</section>
+
+<p style="color: var(--muted); font-size: 13px; margin-top: 64px;">Generated from the mini-os32 source and README — if this page and the OS ever disagree, the OS wins; tell Claude to regenerate the doc.</p>
+</main>
+</div>
+
+<script>
+(function () {
+  var q = document.getElementById('q');
+  var hits = document.getElementById('hits');
+  var entries = Array.prototype.slice.call(document.querySelectorAll('.entry, .tablewrap, section > p, section > h3'));
+  var sections = Array.prototype.slice.call(document.querySelectorAll('section'));
+
+  function norm(s) { return (s || '').toLowerCase(); }
+
+  function apply() {
+    var t = norm(q.value.trim());
+    if (!t) {
+      entries.forEach(function (e) { e.style.display = ''; });
+      sections.forEach(function (s) { s.style.display = ''; });
+      hits.textContent = '';
+      return;
+    }
+    var shown = 0;
+    sections.forEach(function (sec) {
+      var secTitle = norm(sec.querySelector('h2') ? sec.querySelector('h2').textContent : '');
+      var secMatch = secTitle.indexOf(t) !== -1;
+      var any = false;
+      var kids = sec.querySelectorAll('.entry, .tablewrap, :scope > p, :scope > h3');
+      Array.prototype.forEach.call(kids, function (e) {
+        var hay = norm(e.textContent) + ' ' + norm(e.getAttribute('data-k'));
+        var ok = secMatch || hay.indexOf(t) !== -1;
+        e.style.display = ok ? '' : 'none';
+        if (ok) { any = true; shown++; }
+      });
+      sec.style.display = (any || secMatch) ? '' : 'none';
+    });
+    hits.textContent = shown + ' match' + (shown === 1 ? '' : 'es');
+  }
+
+  q.addEventListener('input', apply);
+  q.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { q.value = ''; apply(); q.blur(); }
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === '/' && document.activeElement !== q) { e.preventDefault(); q.focus(); }
+  });
+})();
+</script>

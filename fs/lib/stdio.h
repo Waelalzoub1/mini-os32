@@ -29,4 +29,20 @@ int sys_thread_create(void *entry, void *stack);
 int sys_thread_exit(void);
 int sys_sleep(int ms);
 int sys_sleepf(int ms);
+int sys_getcwd(char *buf, int max);
+int sys_setcwd(char *path);
+void sys_poweroff(void);
+int sys_meminfo(void *buf, int max);
+int sys_storage(void *buf, int max);
+int sys_sync(void);
+
+/* Hardware access for user-space drivers; see hw.h for friendlier wrappers.
+ * bdf packs bus<<16|dev<<8|fn. */
+int sys_io_in(int port, int width);
+int sys_io_out(int port, int width, int value);
+int sys_pci_read(int bdf, int off);
+int sys_pci_write(int bdf, int off, int value);
+int sys_map_phys(int phys_lo, int phys_hi, int size);
+int sys_dma_alloc(int size, int *out);
+int sys_irq_wait(int irq, int timeout_ms);
 #endif

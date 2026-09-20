@@ -1,26 +1,48 @@
 #include "libc.h"
 #include <stdint.h>
 
-#define MAX_CODE 65536
+/* Base address programs are linked at.  0 in the OS, where user pointers are
+ * offsets into a segment.  The host test harness overrides this so the same
+ * binary can be mapped and executed flat under Linux. */
+#ifndef LINK_BASE
+#define LINK_BASE 0
+#endif
+
+/* Sized so cc can compile cc.c, which is the largest program this OS has:
+ * 203 functions, 77KB of code, and a 7.5MB .bss.  MAX_NODE is the exception --
+ * the pool is recycled per top-level declaration (see parse_program), so it
+ * only has to hold the biggest single function, not the whole file. */
+#define MAX_CODE 393216   /* cc's codegen is ~3x less dense than gcc's */
 #define MAX_RODATA 98304
 #define MAX_DATA 32768
-#define MAX_BSS 1048576
+/* A bound check, not a buffer: costs nothing.  20 MB: cc's own bss is
+   ~18.3 MB and the user arena tops out near 23 MB with the stack.
+   (Kept above the #define: cc's preprocessor is line-based and cannot
+   digest a block comment that opens on a directive line.) */
+#define MAX_BSS 20971520
 #define MAX_TOK 4096
 #define MAX_NODE 4096
-#define MAX_SYM 256
-#define MAX_FUNC 64
-#define MAX_FIX 512
-#define MAX_LABEL 512
-#define MAX_TYPE 512
-#define MAX_STRUCT 64
+#define MAX_SYM 1024
+#define MAX_FUNC 512
+#define MAX_FIX 8192    /* label/symbol fixups: two arrays, cheap */
+/* Per-object relocation tables, so this one is multiplied by MAX_OBJ.
+ * gcc emits 2589 relocations for cc.c, so 4096 is comfortable. */
+#define MAX_RELOC 12288
+/* cc.c needs >2048 labels; overflowing this array clobbered label_count
+   itself (the next thing in .bss) and silently reused label indices. */
+#define MAX_LABEL 8192
+#define MAX_TYPE 4096   /* cc.c itself needs a bit over 2048 */
+#define MAX_STRUCT 128
 #define MAX_FIELD 64
-#define MAX_TYPEDEF 128
-#define MAX_OBJ 8
+#define MAX_TYPEDEF 256
+#define MAX_CASE 256
+#define MAX_PARAM 16   /* cc.c has 9-argument functions */
+#define MAX_OBJ 6   /* start + stdio + three sources is the self-host case */
 #define MAX_OUT_TEXT (MAX_CODE * MAX_OBJ)
 #define MAX_OUT_RODATA (MAX_RODATA * MAX_OBJ)
 #define MAX_OUT_DATA (MAX_DATA * MAX_OBJ)
 
-typedef enum { TY_INT, TY_FLOAT, TY_CHAR, TY_BOOL, TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION } TypeKind;
+typedef enum { TY_INT, TY_SHORT, TY_FLOAT, TY_CHAR, TY_BOOL, TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION } TypeKind;
 
 typedef struct Type Type;
 typedef struct StructDef StructDef;
@@ -53,9 +75,9 @@ struct Type {
 
 #define TOK_TEXT_MAX 192
 #define LINEBUF_MAX 1536
-#define SRCBUF_MAX 196608
+#define SRCBUF_MAX 262144   /* cc.c is ~167KB and has to fit whole */
 #define PPBUF_MAX 393216
-#define INC_BUF_MAX 196608
+#define INC_BUF_MAX 65536   /* headers only; the pool is 9 deep */
 #define PP_MAX_DEPTH 9
 
 typedef struct {
@@ -80,13 +102,14 @@ enum {
     TOK_PLUS, TOK_MINUS, TOK_MUL, TOK_DIV,
     TOK_ASSIGN,
     TOK_EQ, TOK_NE, TOK_LT, TOK_LE, TOK_GT, TOK_GE,
-    TOK_RETURN, TOK_IF, TOK_ELSE, TOK_WHILE, TOK_FOR,
+    TOK_RETURN, TOK_IF, TOK_ELSE, TOK_WHILE, TOK_FOR, TOK_DO, TOK_GOTO,
     TOK_SWITCH, TOK_CASE, TOK_DEFAULT, TOK_BREAK, TOK_CONTINUE,
     TOK_TYPEDEF, TOK_STRUCT, TOK_UNION, TOK_EXTERN, TOK_ENUM,
     TOK_INT, TOK_FLOAT, TOK_KW_CHAR, TOK_BOOL, TOK_VOID, TOK_SIZEOF, TOK_UNSIGNED, TOK_SIGNED,
     TOK_CONST, TOK_VOLATILE, TOK_STATIC, TOK_AUTO, TOK_REGISTER, TOK_SHORT, TOK_LONG,
     TOK_DOT, TOK_LBRACK, TOK_RBRACK, TOK_COLON, TOK_ARROW, TOK_AMP, TOK_ELLIPSIS,
     TOK_OR, TOK_XOR, TOK_TILDE, TOK_MOD, TOK_SHL, TOK_SHR,
+    TOK_INC, TOK_DEC, TOK_OPASSIGN,
     TOK_LAND, TOK_LOR, TOK_LOGNOT, TOK_QUESTION
 };
 
@@ -100,7 +123,7 @@ typedef struct Node {
     struct Node *lhs;
     struct Node *rhs;
     struct Node *callee;
-    struct Node *args[8];
+    struct Node *args[MAX_PARAM];
     int argc;
 } Node;
 
@@ -124,16 +147,57 @@ typedef struct {
     int defined;
     int is_static;
     int param_count;
-    Type *params[8];
+    Type *params[MAX_PARAM];
     int is_varargs;
     int declared;
 } Func;
+
+/* Powers of ten as floats.  Every entry up to 1e10 is exact; past that the
+ * value is the nearest float, which is still a better multiplier than
+ * repeated scaling because the result is rounded only once. */
+static const float pow10_tab[39] = {
+    1e0f,  1e1f,  1e2f,  1e3f,  1e4f,  1e5f,  1e6f,  1e7f,  1e8f,  1e9f,
+    1e10f, 1e11f, 1e12f, 1e13f, 1e14f, 1e15f, 1e16f, 1e17f, 1e18f, 1e19f,
+    1e20f, 1e21f, 1e22f, 1e23f, 1e24f, 1e25f, 1e26f, 1e27f, 1e28f, 1e29f,
+    1e30f, 1e31f, 1e32f, 1e33f, 1e34f, 1e35f, 1e36f, 1e37f, 1e38f
+};
+
+/* v * 10^e, in one rounding step wherever the exponent fits the table. */
+static float scale_pow10(float v, int e) {
+    if (e == 0) return v;
+    if (e > 0) {
+        if (e <= 38) return v * pow10_tab[e];
+        /* Past 1e38 a float is infinite anyway; two steps get there. */
+        return v * pow10_tab[38] * pow10_tab[e - 38 > 38 ? 38 : e - 38];
+    }
+    if (e >= -38) return v / pow10_tab[-e];
+    return v / pow10_tab[38] / pow10_tab[(-e) - 38 > 38 ? 38 : (-e) - 38];
+}
 
 static const char *src;
 static int pos;
 static Token tok;
 static char cur_file[64];
 static char incbuf_pool[PP_MAX_DEPTH][INC_BUF_MAX];
+
+/* The parser sees the preprocessed buffer, where #include splices files
+ * together and directive lines vanish, so buffer line numbers drift from the
+ * file the user edited.  The preprocessor records, for every line it emits,
+ * which file and line it came from; diagnostics translate through this map. */
+#define MAX_LM_LINES 24576
+#define MAX_LM_FILES 24
+static int lm_line[MAX_LM_LINES];
+static uint8_t lm_file[MAX_LM_LINES];
+static char lm_files[MAX_LM_FILES][64];
+static int lm_files_len;
+static int lm_count;
+
+/* A for-loop's post expression (and loop conditions) are parsed where they
+ * appear but code-generated after the body, when the lexer has moved on.
+ * Errors raised during that late generation point here instead of at the
+ * current token.  Active while diag_ovr_end > 0. */
+static int diag_ovr_pos;
+static int diag_ovr_end;
 static int warn_count;
 static int func_has_return;
 static int dbg_for = 0;
@@ -165,11 +229,12 @@ static Typedef typedefs[MAX_TYPEDEF];
 static int typedefs_len;
 
 typedef struct { char name[32]; int val; } EnumConst;
-static EnumConst enum_consts[256];
+static EnumConst enum_consts[512];
 static int enum_const_len;
 
 static Type type_int, type_float, type_char, type_bool, type_void;
 static Type type_uint, type_uchar;
+static Type type_short, type_ushort;
 
 static Sym globals[MAX_SYM];
 static int globals_len;
@@ -218,9 +283,9 @@ typedef struct {
     int bss_len;
     ObjSym syms[MAX_SYM];
     int sym_len;
-    ObjRelocLoc lreloc[MAX_FIX];
+    ObjRelocLoc lreloc[MAX_RELOC];
     int lreloc_len;
-    ObjRelocSym sreloc[MAX_FIX];
+    ObjRelocSym sreloc[MAX_RELOC];
     int sreloc_len;
 } Obj;
 
@@ -229,8 +294,8 @@ static Obj objs[MAX_OBJ + 1];
 
 typedef struct {
     int count;
-    Type *types[8];
-    char names[8][32];
+    Type *types[MAX_PARAM];
+    char names[MAX_PARAM][32];
     int is_varargs;
 } ParamInfo;
 
@@ -250,7 +315,7 @@ typedef struct { int pos; int type; char name[32]; } SymFix;
 static SymFix sym_fix[MAX_FIX];
 static int sym_fix_len;
 
-enum { AF_STR = 1, AF_GLOB = 2 };
+enum { AF_STR = 1, AF_GLOB = 2, AF_STR_DATA = 3 };
 
 typedef struct { int break_label; int continue_label; } BreakCtx;
 static BreakCtx break_stack[16];
@@ -262,15 +327,21 @@ typedef struct {
     int default_label;
     int temp_offset;
     int case_count;
-    int case_values[64];
-    int case_labels[64];
+    int case_values[MAX_CASE];
+    int case_labels[MAX_CASE];
 } SwitchCtx;
 static SwitchCtx switch_stack[8];
 static int switch_depth;
 
 static Field *find_field(StructDef *s, const char *name);
 
-static void emit8(uint8_t b) { if (code_len < MAX_CODE) code[code_len++] = b; }
+/* Overflowing here used to drop bytes silently, which produced an object
+ * whose relocations pointed past its own text -- a corrupt binary rather than
+ * an error. */
+static void emit8(uint8_t b) {
+    if (code_len >= MAX_CODE) { puts("code ovf\n"); sys_exit(1); }
+    code[code_len++] = b;
+}
 static void emit32(uint32_t v) {
     emit8((uint8_t)(v & 0xFF));
     emit8((uint8_t)((v >> 8) & 0xFF));
@@ -315,6 +386,24 @@ static void make_static_link_name(char *out) {
     out[oi] = 0;
 }
 
+static void lm_add(const char *fname, int line) {
+    if (lm_count >= MAX_LM_LINES) return;
+    int fi = 0;
+    while (fi < lm_files_len && strcmp(lm_files[fi], fname)) fi++;
+    if (fi == lm_files_len) {
+        if (lm_files_len >= MAX_LM_FILES) {
+            fi = 0;
+        } else {
+            strncpy(lm_files[lm_files_len], fname, 63);
+            lm_files[lm_files_len][63] = 0;
+            lm_files_len++;
+        }
+    }
+    lm_file[lm_count] = (uint8_t)fi;
+    lm_line[lm_count] = line;
+    lm_count++;
+}
+
 static void compute_line_col_at(int at, int *out_line, int *out_col) {
     int line = 1;
     int col = 1;
@@ -332,8 +421,14 @@ static void diag_near_span(int at, int end) {
     int line = 1;
     int col = 1;
     compute_line_col_at(at, &line, &col);
-    if (cur_file[0]) { puts(cur_file); putc(':'); }
-    print_dec(line); putc(':'); print_dec(col); puts(": ");
+    const char *fname = cur_file;
+    int shown = line;
+    if (line <= lm_count) {
+        fname = lm_files[lm_file[line - 1]];
+        shown = lm_line[line - 1];
+    }
+    if (fname[0]) { puts(fname); putc(':'); }
+    print_dec(shown); putc(':'); print_dec(col); puts(": ");
     /* print line content */
     int start = at;
     while (start > 0 && src[start - 1] != '\n') start--;
@@ -361,6 +456,7 @@ static void diag_near_at(int at) {
 }
 
 static void diag_near(void) {
+    if (diag_ovr_end > 0) { diag_near_span(diag_ovr_pos, diag_ovr_end); return; }
     diag_near_span(tok.pos, tok.end);
 }
 
@@ -440,6 +536,9 @@ static const char *tok_name(int k) {
     case TOK_TILDE: return "'~'";
     case TOK_SHL: return "'<<'";
     case TOK_SHR: return "'>>'";
+    case TOK_INC: return "'++'";
+    case TOK_DEC: return "'--'";
+    case TOK_OPASSIGN: return "compound assignment";
     case TOK_LAND: return "'&&'";
     case TOK_LOR: return "'||'";
     case TOK_LOGNOT: return "'!'";
@@ -451,6 +550,8 @@ static const char *tok_name(int k) {
     case TOK_ELSE: return "else";
     case TOK_WHILE: return "while";
     case TOK_FOR: return "for";
+    case TOK_DO: return "do";
+    case TOK_GOTO: return "goto";
     case TOK_SWITCH: return "switch";
     case TOK_CASE: return "case";
     case TOK_DEFAULT: return "default";
@@ -534,7 +635,10 @@ static void emit_mov_membp_eax(int disp) { emit8(0x89); emit8(0x85); emit32((uin
 static void emit_mov_eax_memabs(uint32_t addr) { emit8(0xA1); emit32(addr); }
 static void emit_mov_memabs_eax(uint32_t addr) { emit8(0xA3); emit32(addr); }
 
-static int new_label(void) { return label_count++; }
+static int new_label(void) {
+    if (label_count >= MAX_LABEL) { puts("label ovf\n"); sys_exit(1); }
+    return label_count++;
+}
 
 static void set_label(int id) { labels_pos[id] = code_len; labels_def[id] = 1; }
 
@@ -542,25 +646,26 @@ static void emit_jmp_label(int id) {
     emit8(0xE9);
     int pos = code_len;
     emit32(0);
-    fixups[fixup_len++] = (Fix){ pos, id };
+    fixups[fixup_len].pos = pos; fixups[fixup_len].label = id; fixup_len++;
 }
 
 static void emit_jcc_label(int cc, int id) {
     emit8(0x0F); emit8((uint8_t)cc);
     int pos = code_len;
     emit32(0);
-    fixups[fixup_len++] = (Fix){ pos, id };
+    fixups[fixup_len].pos = pos; fixups[fixup_len].label = id; fixup_len++;
 }
 
 static void emit_call_label(int id) {
     emit8(0xE8);
     int pos = code_len;
     emit32(0);
-    fixups[fixup_len++] = (Fix){ pos, id };
+    fixups[fixup_len].pos = pos; fixups[fixup_len].label = id; fixup_len++;
 }
 
 static void add_addr_fix(int pos, int kind, int index) {
-    addr_fix[addr_fix_len++] = (AddrFix){ pos, kind, index };
+    addr_fix[addr_fix_len].pos = pos; addr_fix[addr_fix_len].kind = kind;
+    addr_fix[addr_fix_len].index = index; addr_fix_len++;
 }
 
 static void add_sym_fix(int pos, int type, const char *name) {
@@ -585,6 +690,58 @@ static void skip_ws(void) {
 static int is_alpha(char c) { return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||c=='_'; }
 static int is_alnum(char c) { return is_alpha(c)||(c>='0'&&c<='9'); }
 
+/* Decode one escape sequence, with `pos` just past the backslash.
+ *
+ * The old code understood only \n and \t and fell through to "keep the
+ * character", which silently turned "\0" into the digit 0 and "\r" into the
+ * letter r.  Unknown escapes now warn rather than passing quietly. */
+static int lex_escape(void) {
+    char e = src[pos++];
+    switch (e) {
+    case 'n': return '\n';
+    case 't': return '\t';
+    case 'r': return '\r';
+    case 'a': return 7;
+    case 'b': return 8;
+    case 'f': return 12;
+    case 'v': return 11;
+    case 'e': return 27;          /* common extension */
+    case '\\': return '\\';
+    case '\'': return '\'';
+    case '"': return '"';
+    case '?': return '?';
+    case 'x': {
+        int v = 0, n = 0;
+        for (;;) {
+            char h = src[pos];
+            int d = -1;
+            if (h >= '0' && h <= '9') d = h - '0';
+            else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
+            else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
+            if (d < 0) break;
+            v = v * 16 + d;
+            pos++;
+            n++;
+        }
+        if (!n) warn_here("\\x with no hex digits");
+        return v & 0xFF;
+    }
+    default:
+        if (e >= '0' && e <= '7') {          /* octal, up to three digits */
+            int v = e - '0';
+            for (int n = 1; n < 3; n++) {
+                char o = src[pos];
+                if (o < '0' || o > '7') break;
+                v = v * 8 + (o - '0');
+                pos++;
+            }
+            return v & 0xFF;
+        }
+        warn_here("unknown escape sequence");
+        return e;
+    }
+}
+
 static void next_token(void) {
     skip_ws();
     int start = pos;
@@ -605,6 +762,8 @@ static void next_token(void) {
         else if (!strcmp(tok.text, "else")) tok.kind = TOK_ELSE;
         else if (!strcmp(tok.text, "while")) tok.kind = TOK_WHILE;
         else if (!strcmp(tok.text, "for")) tok.kind = TOK_FOR;
+        else if (!strcmp(tok.text, "do")) tok.kind = TOK_DO;
+        else if (!strcmp(tok.text, "goto")) tok.kind = TOK_GOTO;
         else if (!strcmp(tok.text, "switch")) tok.kind = TOK_SWITCH;
         else if (!strcmp(tok.text, "case")) tok.kind = TOK_CASE;
         else if (!strcmp(tok.text, "default")) tok.kind = TOK_DEFAULT;
@@ -653,6 +812,7 @@ static void next_token(void) {
             }
             tok.kind = TOK_NUM;
             tok.ival = v;
+            while (src[pos]=='u'||src[pos]=='U'||src[pos]=='l'||src[pos]=='L') pos++;
             tok.end = pos;
             return;
         }
@@ -660,17 +820,66 @@ static void next_token(void) {
             if (src[pos]=='.') has_dot = 1;
             pos++;
         }
-        int len = pos - start;
-        float f = 0.0f;
-        int i = 0;
-        while (i < len && src[start+i] != '.') { f = f*10.0f + (src[start+i]-'0'); i++; }
-        if (i < len && src[start+i]=='.') {
-            i++;
-            float place = 0.1f;
-            while (i < len) { f += (src[start+i]-'0')*place; place *= 0.1f; i++; }
+        int len = pos - start;   /* mantissa only -- the exponent is scanned below */
+
+        /* Exponent form: 1.5e3, 1e-5, 2E+8.  An 'e' only starts one when at
+         * least one digit follows, so `3.0extra` still lexes as a number and
+         * then an identifier rather than swallowing the name. */
+        int has_exp = 0, exp_neg = 0, exp_val = 0;
+        if (src[pos]=='e' || src[pos]=='E') {
+            int q = pos + 1;
+            int sgn = 0;
+            if (src[q]=='+' || src[q]=='-') { sgn = (src[q]=='-'); q++; }
+            if (src[q] >= '0' && src[q] <= '9') {
+                has_exp = 1;
+                exp_neg = sgn;
+                while (src[q] >= '0' && src[q] <= '9') { exp_val = exp_val*10 + (src[q]-'0'); q++; }
+                pos = q;
+            }
         }
-        if (has_dot) { tok.kind = TOK_FNUM; tok.fval = f; }
-        else { tok.kind = TOK_NUM; tok.ival = (int)f; }
+
+        if (!has_dot && !has_exp) {
+            /* Accumulate integers as integers.  The old path ran every decimal
+             * literal through a float, whose 24-bit mantissa silently mangles
+             * anything past 16777216 -- so 4000000000 never survived. */
+            unsigned int uv = 0;
+            for (int k = 0; k < len; k++) uv = uv * 10u + (unsigned int)(src[start+k] - '0');
+            tok.kind = TOK_NUM;
+            tok.ival = (int)uv;
+            while (src[pos]=='u'||src[pos]=='U'||src[pos]=='l'||src[pos]=='L') pos++;
+            tok.end = pos;
+            return;
+        }
+        /* Gather every digit into one integer mantissa and scale it once.
+         * Scaling a float by 0.1 per digit rounds at every step and puts 0.1
+         * and friends in the wrong place; a single multiply or divide by an
+         * exact power of ten rounds once, which is the best a float can do.
+         *
+         * No double here on purpose: cc has no such type, and cc.c has to stay
+         * inside the language cc accepts for it to compile itself. */
+        unsigned int mant = 0;
+        int mdigits = 0;
+        int frac_digits = 0;
+        int seen_dot = 0;
+        int i = 0;
+        for (i = 0; i < len; i++) {
+            char d = src[start+i];
+            if (d == '.') { seen_dot = 1; continue; }
+            /* A float carries ~7 digits; past 9 the rest only overflow mant.
+             * Digits dropped before the point still have to shift the value. */
+            if (mdigits < 9) {
+                mant = mant * 10u + (unsigned int)(d - '0');
+                mdigits++;
+                if (seen_dot) frac_digits++;
+            } else if (!seen_dot) {
+                frac_digits--;
+            }
+        }
+
+        int e10 = (has_exp ? (exp_neg ? -exp_val : exp_val) : 0) - frac_digits;
+        tok.kind = TOK_FNUM;
+        tok.fval = scale_pow10((float)mant, e10);
+        if (src[pos]=='f'||src[pos]=='F') pos++;
         tok.end = pos;
         return;
     }
@@ -679,13 +888,9 @@ static void next_token(void) {
         pos++;
         int i=0;
         while (src[pos] && src[pos] != '"' && i < (TOK_TEXT_MAX - 1)) {
-            char ch = src[pos++];
-            if (ch=='\\') {
-                ch = src[pos++];
-                if (ch=='n') ch='\n';
-                else if (ch=='t') ch='\t';
-            }
-            tok.text[i++] = ch;
+            int ch = src[pos++];
+            if (ch=='\\') ch = lex_escape();
+            tok.text[i++] = (char)ch;
         }
         tok.text[i]=0;
         if (src[pos]=='"') pos++;
@@ -696,12 +901,8 @@ static void next_token(void) {
 
     if (c=='\'') {
         pos++;
-        char ch = src[pos++];
-        if (ch=='\\') {
-            ch = src[pos++];
-            if (ch=='n') ch='\n';
-            else if (ch=='t') ch='\t';
-        }
+        int ch = src[pos++];
+        if (ch=='\\') ch = lex_escape();
         if (src[pos]=='\'') pos++;
         tok.kind = TOK_CHAR;
         tok.ival = (int)(unsigned char)ch;
@@ -724,20 +925,35 @@ static void next_token(void) {
     case '.':
         if (src[pos] == '.' && src[pos+1] == '.') { pos += 2; tok.kind = TOK_ELLIPSIS; tok.end = pos; return; }
         tok.kind = TOK_DOT; tok.end = pos; return;
-    case '+': tok.kind = TOK_PLUS; tok.end = pos; return;
+    case '+':
+        if (src[pos] == '+') { pos++; tok.kind = TOK_INC; tok.end = pos; return; }
+        if (src[pos] == '=') { pos++; tok.kind = TOK_OPASSIGN; tok.ival = '+'; tok.end = pos; return; }
+        tok.kind = TOK_PLUS; tok.end = pos; return;
     case '-':
         if (src[pos] == '>') { pos++; tok.kind = TOK_ARROW; tok.end = pos; return; }
+        if (src[pos] == '-') { pos++; tok.kind = TOK_DEC; tok.end = pos; return; }
+        if (src[pos] == '=') { pos++; tok.kind = TOK_OPASSIGN; tok.ival = '-'; tok.end = pos; return; }
         tok.kind = TOK_MINUS; tok.end = pos; return;
-    case '*': tok.kind = TOK_MUL; tok.end = pos; return;
-    case '/': tok.kind = TOK_DIV; tok.end = pos; return;
-    case '%': tok.kind = TOK_MOD; tok.end = pos; return;
+    case '*':
+        if (src[pos] == '=') { pos++; tok.kind = TOK_OPASSIGN; tok.ival = '*'; tok.end = pos; return; }
+        tok.kind = TOK_MUL; tok.end = pos; return;
+    case '/':
+        if (src[pos] == '=') { pos++; tok.kind = TOK_OPASSIGN; tok.ival = '/'; tok.end = pos; return; }
+        tok.kind = TOK_DIV; tok.end = pos; return;
+    case '%':
+        if (src[pos] == '=') { pos++; tok.kind = TOK_OPASSIGN; tok.ival = '%'; tok.end = pos; return; }
+        tok.kind = TOK_MOD; tok.end = pos; return;
     case '&':
         if (src[pos] == '&') { pos++; tok.kind = TOK_LAND; tok.end = pos; return; }
+        if (src[pos] == '=') { pos++; tok.kind = TOK_OPASSIGN; tok.ival = '&'; tok.end = pos; return; }
         tok.kind = TOK_AMP; tok.end = pos; return;
     case '|':
         if (src[pos] == '|') { pos++; tok.kind = TOK_LOR; tok.end = pos; return; }
+        if (src[pos] == '=') { pos++; tok.kind = TOK_OPASSIGN; tok.ival = '|'; tok.end = pos; return; }
         tok.kind = TOK_OR; tok.end = pos; return;
-    case '^': tok.kind = TOK_XOR; tok.end = pos; return;
+    case '^':
+        if (src[pos] == '=') { pos++; tok.kind = TOK_OPASSIGN; tok.ival = '^'; tok.end = pos; return; }
+        tok.kind = TOK_XOR; tok.end = pos; return;
     case '~': tok.kind = TOK_TILDE; tok.end = pos; return;
     case '=':
         if (src[pos]=='=') { pos++; tok.kind = TOK_EQ; }
@@ -748,13 +964,21 @@ static void next_token(void) {
         if (src[pos]=='=') { pos++; tok.kind = TOK_NE; tok.end = pos; return; }
         tok.kind = TOK_LOGNOT; tok.end = pos; return;
     case '<':
-        if (src[pos]=='<') { pos++; tok.kind = TOK_SHL; }
+        if (src[pos]=='<') {
+            pos++;
+            if (src[pos]=='=') { pos++; tok.kind = TOK_OPASSIGN; tok.ival = 'L'; tok.end = pos; return; }
+            tok.kind = TOK_SHL;
+        }
         else if (src[pos]=='=') { pos++; tok.kind = TOK_LE; }
         else tok.kind = TOK_LT;
         tok.end = pos;
         return;
     case '>':
-        if (src[pos]=='>') { pos++; tok.kind = TOK_SHR; }
+        if (src[pos]=='>') {
+            pos++;
+            if (src[pos]=='=') { pos++; tok.kind = TOK_OPASSIGN; tok.ival = 'R'; tok.end = pos; return; }
+            tok.kind = TOK_SHR;
+        }
         else if (src[pos]=='=') { pos++; tok.kind = TOK_GE; }
         else tok.kind = TOK_GT;
         tok.end = pos;
@@ -802,6 +1026,7 @@ static Type *type_union(StructDef *sdef) {
 static int type_size(Type *t) { return t ? t->size : 0; }
 static int type_align(Type *t) { return t ? t->align : 1; }
 static int is_int(Type *t) { return t && t->kind == TY_INT; }
+static int is_short(Type *t) { return t && t->kind == TY_SHORT; }
 static int is_float(Type *t) { return t && t->kind == TY_FLOAT; }
 static int is_char(Type *t) { return t && t->kind == TY_CHAR; }
 static int is_bool(Type *t) { return t && t->kind == TY_BOOL; }
@@ -813,7 +1038,7 @@ static int is_array(Type *t) { return t && t->kind == TY_ARRAY; }
 static int is_struct(Type *t) { return t && t->kind == TY_STRUCT; }
 static int is_union(Type *t) { return t && t->kind == TY_UNION; }
 static int is_record(Type *t) { return is_struct(t) || is_union(t); }
-static int is_numeric(Type *t) { return is_int(t) || is_float(t) || is_char(t) || is_bool(t); }
+static int is_numeric(Type *t) { return is_int(t) || is_short(t) || is_float(t) || is_char(t) || is_bool(t); }
 static int is_unsigned_type(Type *t) { return t && t->is_unsigned; }
 static int is_byte(Type *t) { return is_char(t) || is_bool(t); }
 
@@ -920,6 +1145,10 @@ static void init_types(void) {
     type_bool.kind = TY_BOOL; type_bool.size = 1; type_bool.align = 1; type_bool.is_unsigned = 1;
     memset(&type_uchar, 0, sizeof(type_uchar));
     type_uchar.kind = TY_CHAR; type_uchar.size = 1; type_uchar.align = 1; type_uchar.is_unsigned = 1;
+    memset(&type_short, 0, sizeof(type_short));
+    type_short.kind = TY_SHORT; type_short.size = 2; type_short.align = 2; type_short.is_unsigned = 0;
+    memset(&type_ushort, 0, sizeof(type_ushort));
+    type_ushort.kind = TY_SHORT; type_ushort.size = 2; type_ushort.align = 2; type_ushort.is_unsigned = 1;
     memset(&type_void, 0, sizeof(type_void));
     type_void.kind = TY_VOID; type_void.size = 0; type_void.align = 1;
 
@@ -927,8 +1156,12 @@ static void init_types(void) {
     add_typedef("va_list", type_ptr(&type_char));
 }
 
+/* Backwards, so the innermost declaration of a name shadows an outer one.
+ * Searching forwards meant a `Field *f` in one block was masked by a `Func *f`
+ * declared earlier in a sibling block, and the member lookup then failed
+ * against the wrong struct. */
 static Sym *find_local(const char *name) {
-    for (int i=0;i<locals_len;i++) if (!strcmp(locals[i].name,name)) return &locals[i];
+    for (int i=locals_len-1;i>=0;i--) if (!strcmp(locals[i].name,name)) return &locals[i];
     return 0;
 }
 
@@ -1054,6 +1287,7 @@ static Sym *add_global_data(const char *name, Type *ty) {
     s->section = SEC_DATA;
     s->alias_global = -1;
     sym_set_link_name(s, 0);
+    if (off + size > MAX_DATA) { puts("data ovf\n"); sys_exit(1); }
     for (int i = 0; i < size; i++) data_seg[off + i] = 0;
     data_len = off + size;
     return s;
@@ -1074,6 +1308,7 @@ static Sym *define_global_data_existing(Sym *s, Type *ty) {
     s->is_extern = 0;
     s->section = SEC_DATA;
     s->alias_global = -1;
+    if (off + size > MAX_DATA) { puts("data ovf\n"); sys_exit(1); }
     for (int i = 0; i < size; i++) data_seg[off + i] = 0;
     data_len = off + size;
     return s;
@@ -1163,11 +1398,21 @@ static Node *parse_expr(void);
 
 static Type *parse_struct_spec(int is_union);
 static Node *parse_shift(void);
+static Node *parse_cond(void);
+static int eval_const(Node *n, int *out);
 static Node *parse_bitand(void);
 static Node *parse_bitxor(void);
 static Node *parse_bitor(void);
 static Node *parse_land(void);
 static Node *parse_lor(void);
+
+/* Consume any run of cv-qualifiers.  C lets these appear before the type,
+ * after it, and after each '*' in a declarator; the parser previously only
+ * handled the leading position, so "int const *p" and "char * const p" were
+ * both rejected. */
+static void skip_cv(void) {
+    while (consume(TOK_CONST) || consume(TOK_VOLATILE)) { }
+}
 
 static Type *parse_type_spec(void) {
     int uns = 0;
@@ -1182,11 +1427,14 @@ static Type *parse_type_spec(void) {
         if (consume(TOK_SHORT)) { shortc++; saw_spec = 1; continue; }
         break;
     }
-    if (consume(TOK_INT)) return uns ? &type_uint : &type_int;
-    if (consume(TOK_FLOAT)) return &type_float;
-    if (consume(TOK_KW_CHAR)) return uns ? &type_uchar : &type_char;
-    if (consume(TOK_BOOL)) return &type_bool;
-    if (consume(TOK_VOID)) return &type_void;
+    /* "short" and "short int" are a real 16-bit type; "long" stays 32-bit,
+     * which is correct for this ILP32 target. */
+    if (shortc) { consume(TOK_INT); skip_cv(); return uns ? &type_ushort : &type_short; }
+    if (consume(TOK_INT)) { skip_cv(); return uns ? &type_uint : &type_int; }
+    if (consume(TOK_FLOAT)) { skip_cv(); return &type_float; }
+    if (consume(TOK_KW_CHAR)) { skip_cv(); return uns ? &type_uchar : &type_char; }
+    if (consume(TOK_BOOL)) { skip_cv(); return &type_bool; }
+    if (consume(TOK_VOID)) { skip_cv(); return &type_void; }
     if (consume(TOK_STRUCT)) return parse_struct_spec(0);
     if (consume(TOK_UNION)) return parse_struct_spec(1);
     if (consume(TOK_ENUM)) {
@@ -1217,10 +1465,10 @@ static Type *parse_type_spec(void) {
         }
         return &type_int;
     }
-    if (uns || longc || shortc || saw_spec) return uns ? &type_uint : &type_int;
+    if (uns || longc || saw_spec) { skip_cv(); return uns ? &type_uint : &type_int; }
     if (tok.kind == TOK_ID) {
         Typedef *td = find_typedef(tok.text);
-        if (td) { next_token(); return td->type; }
+        if (td) { next_token(); skip_cv(); return td->type; }
     }
     return 0;
 }
@@ -1234,10 +1482,10 @@ static int is_type_start(void) {
 }
 
 static Type *parse_declarator(Type *base, char *out_name) {
-    while (consume(TOK_MUL)) base = type_ptr(base);
+    while (consume(TOK_MUL)) { base = type_ptr(base); skip_cv(); }
     if (consume(TOK_LPAREN)) {
         int inner_ptr = 0;
-        while (consume(TOK_MUL)) { inner_ptr++; }
+        while (consume(TOK_MUL)) { inner_ptr++; skip_cv(); }
         if (tok.kind != TOK_ID) { error_here("decl name\n"); }
         strncpy(out_name, tok.text, 31);
         next_token();
@@ -1256,13 +1504,31 @@ static Type *parse_declarator(Type *base, char *out_name) {
         strncpy(out_name, tok.text, 31);
         next_token();
     }
+    /* Suffixes are collected first and applied right-to-left: in
+     * `char x[2][3]` the FIRST suffix is the OUTERmost dimension, so the
+     * last one must wrap `base` first.  Applying them as they are read
+     * inverts the nesting -- x[i] then strides by 2 instead of 3, and a
+     * `char names[][64]` parameter decays to a pointer whose element size
+     * is 0, collapsing every row onto row 0. */
+    int dims[8];
+    int ndims = 0;
     while (consume(TOK_LBRACK)) {
-        if (tok.kind != TOK_NUM) { error_here("array size\n"); }
-        int len = tok.ival;
-        next_token();
-        expect(TOK_RBRACK);
-        base = type_array(base, len);
+        /* "[]" leaves the length to be filled in from the initialiser; the
+         * declaration sites replace the type once they have seen it. */
+        int len = 0;
+        if (tok.kind == TOK_RBRACK) {
+            next_token();
+        } else {
+            /* A constant expression, not just a literal: `buf[MAX + 1]` and
+             * `t[sizeof(x)]` are ordinary C and cc.c is full of them. */
+            if (!eval_const(parse_cond(), &len)) { error_here("array size not constant\n"); }
+            if (len < 0) { error_here("negative array size\n"); }
+            expect(TOK_RBRACK);
+        }
+        if (ndims >= 8) { error_here("array dims\n"); }
+        dims[ndims++] = len;
     }
+    for (int i = ndims - 1; i >= 0; i--) base = type_array(base, dims[i]);
     return base;
 }
 
@@ -1292,8 +1558,13 @@ static Type *parse_struct_spec(int is_union) {
         struct_layout(sd);
     } else {
         if (!sname[0]) { error_here("struct name\n"); }
-        sd = find_struct(sname);
-        if (!sd) { error_here("unknown struct\n"); }
+        /* A tag with no body is a forward declaration: create it incomplete
+         * (size 0) and let the later definition fill it in.  struct_layout
+         * refreshes the cached Type, so pointers taken before the body is
+         * seen get the right size once it arrives.  This is what makes the
+         * self-referential `typedef struct Node Node;` idiom work, and cc.c
+         * is written that way. */
+        sd = add_struct(sname, is_union);
     }
     return is_union ? type_union(sd) : type_struct(sd);
 }
@@ -1301,7 +1572,7 @@ static Type *parse_struct_spec(int is_union) {
 static Type *parse_type_name(void) {
     Type *base = parse_type_spec();
     if (!base) { puts("type?\n"); sys_exit(1); }
-    while (consume(TOK_MUL)) base = type_ptr(base);
+    while (consume(TOK_MUL)) { base = type_ptr(base); skip_cv(); }
     return base;
 }
 
@@ -1345,7 +1616,7 @@ static Type *infer_type(Node *n) {
         if (is_ptr(t)) t = t->base;
         if (!is_record(t)) { puts("member struct\n"); sys_exit(1); }
         Field *f = find_field(t->sdef, n->name);
-        if (!f) { puts("no field\n"); sys_exit(1); }
+        if (!f) { puts("no field: "); puts(n->name); putc('\n'); error_here("unknown member\n"); }
         return f->type;
     }
     case ND_CAST:
@@ -1428,6 +1699,43 @@ static Node *parse_primary(void) {
     return 0;
 }
 
+/* ++, -- and "op=" are desugared here rather than given their own codegen.
+ *
+ *     ++x        ->  (x = x + 1)
+ *     x++        ->  (x = x + 1) - 1      yields the old value
+ *     x op= e    ->  (x = x op e)
+ *
+ * The postfix form works for pointers too, since pointer arithmetic scales
+ * both the += and the compensating -=.  The one caveat is that the lvalue is
+ * evaluated twice, so a side-effecting subscript such as a[f()]++ would call
+ * f() twice; plain variables, members and constant indices are unaffected.
+ */
+static Node *node_int(int v) {
+    Node *n = new_node(ND_NUM);
+    n->ival = v;
+    return n;
+}
+
+static Node *node_bin(int op, Node *a, Node *b) {
+    Node *n = new_node(ND_BIN);
+    n->op = op;
+    n->lhs = a;
+    n->rhs = b;
+    return n;
+}
+
+static Node *node_assign(Node *lhs, Node *rhs) {
+    Node *n = new_node(ND_ASSIGN);
+    n->lhs = lhs;
+    n->rhs = rhs;
+    return n;
+}
+
+/* x = x <op> 1 */
+static Node *node_step(Node *lv, int op) {
+    return node_assign(lv, node_bin(op, lv, node_int(1)));
+}
+
 static Node *parse_postfix(void) {
     Node *n = parse_primary();
     for (;;) {
@@ -1449,7 +1757,7 @@ static Node *parse_postfix(void) {
                     continue;
                 } else {
                     do {
-                        if (call->argc >= 8) { puts("too many args\n"); sys_exit(1); }
+                        if (call->argc >= MAX_PARAM) { puts("too many args\n"); sys_exit(1); }
                         call->args[call->argc++] = parse_expr();
                     } while (consume(TOK_COMMA));
                     expect(TOK_RPAREN);
@@ -1487,12 +1795,16 @@ static Node *parse_postfix(void) {
             n = m;
             continue;
         }
+        if (consume(TOK_INC)) { n = node_bin('-', node_step(n, '+'), node_int(1)); continue; }
+        if (consume(TOK_DEC)) { n = node_bin('+', node_step(n, '-'), node_int(1)); continue; }
         break;
     }
     return n;
 }
 
 static Node *parse_unary(void) {
+    if (consume(TOK_INC)) return node_step(parse_unary(), '+');
+    if (consume(TOK_DEC)) return node_step(parse_unary(), '-');
     if (consume(TOK_SIZEOF)) {
         if (consume(TOK_LPAREN)) {
             int save_pos = pos;
@@ -1668,6 +1980,58 @@ static Node *parse_lor(void) {
     return n;
 }
 
+/* Fold an integer constant expression.  Returns 1 and writes *out when the
+ * whole tree is literals and operators; 0 if anything else turns up, so the
+ * caller can report a proper error rather than emit a wrong size.
+ *
+ * `sizeof` needs no case: parse_unary already turns it into ND_NUM. */
+static int eval_const(Node *n, int *out) {
+    if (!n) return 0;
+    if (n->kind == ND_NUM) { *out = n->ival; return 1; }
+    if (n->kind == ND_CAST) return eval_const(n->lhs, out);
+    if (n->kind == ND_UNARY) {
+        int a;
+        if (!eval_const(n->lhs, &a)) return 0;
+        if (n->op == '-') { *out = -a; return 1; }
+        if (n->op == '!') { *out = !a; return 1; }
+        if (n->op == '~') { *out = ~a; return 1; }
+        return 0;
+    }
+    if (n->kind == ND_TERN) {
+        int c;
+        if (!eval_const(n->args[0], &c)) return 0;
+        return eval_const(c ? n->args[1] : n->args[2], out);
+    }
+    if (n->kind != ND_BIN) return 0;
+    int a, b;
+    if (!eval_const(n->lhs, &a)) return 0;
+    /* && and || short-circuit: the right side need not be constant. */
+    if (n->op == 'A' && !a) { *out = 0; return 1; }
+    if (n->op == 'O' && a)  { *out = 1; return 1; }
+    if (!eval_const(n->rhs, &b)) return 0;
+    switch (n->op) {
+    case '+': *out = a + b; return 1;
+    case '-': *out = a - b; return 1;
+    case '*': *out = a * b; return 1;
+    case '/': if (!b) return 0; *out = a / b; return 1;
+    case '%': if (!b) return 0; *out = a % b; return 1;
+    case 'L': *out = a << b; return 1;
+    case 'R': *out = a >> b; return 1;
+    case '&': *out = a & b; return 1;
+    case '|': *out = a | b; return 1;
+    case '^': *out = a ^ b; return 1;
+    case '<': *out = a < b; return 1;
+    case 'l': *out = a <= b; return 1;
+    case '>': *out = a > b; return 1;
+    case 'g': *out = a >= b; return 1;
+    case '=': *out = a == b; return 1;
+    case '!': *out = a != b; return 1;
+    case 'A': *out = a && b; return 1;
+    case 'O': *out = a || b; return 1;
+    default: return 0;
+    }
+}
+
 static Node *parse_cond(void) {
     Node *n = parse_lor();
     if (consume(TOK_QUESTION)) {
@@ -1692,6 +2056,11 @@ static Node *parse_assign(void) {
         a->rhs = parse_assign();
         return a;
     }
+    if (tok.kind == TOK_OPASSIGN) {
+        int op = tok.ival;
+        next_token();
+        return node_assign(n, node_bin(op, n, parse_assign()));
+    }
     return n;
 }
 
@@ -1707,9 +2076,22 @@ static void conv_stack_to_float(int disp) {
     emit8(0xD9); emit8(0x9C); emit8(0x24); emit32((uint32_t)disp); /* fstp dword [esp+disp] */
 }
 
+/* A C cast to int truncates, but the FPU rounds to nearest -- so switch the
+ * rounding mode to chop for just this one instruction and put it back.  The
+ * startup stub used to set chop once and leave it, which quietly truncated
+ * every arithmetic result in the program, not only the casts. */
 static void conv_stack_to_int(int disp) {
     emit8(0xD9); emit8(0x84); emit8(0x24); emit32((uint32_t)disp); /* fld dword [esp+disp] */
-    emit8(0xDB); emit8(0x9C); emit8(0x24); emit32((uint32_t)disp); /* fistp dword [esp+disp] */
+    emit8(0x83); emit8(0xEC); emit8(0x08);                         /* sub esp, 8 */
+    emit8(0xD9); emit8(0x3C); emit8(0x24);                         /* fnstcw [esp]     (saved) */
+    emit8(0xD9); emit8(0x7C); emit8(0x24); emit8(0x04);            /* fnstcw [esp+4]   (scratch) */
+    emit8(0x66); emit8(0x81); emit8(0x4C); emit8(0x24); emit8(0x04);
+    emit8(0x00); emit8(0x0C);                                      /* or word [esp+4], 0x0C00 */
+    emit8(0xD9); emit8(0x6C); emit8(0x24); emit8(0x04);            /* fldcw [esp+4]  -> chop */
+    /* esp moved by 8, so the destination slot moved with it */
+    emit8(0xDB); emit8(0x9C); emit8(0x24); emit32((uint32_t)(disp + 8)); /* fistp dword [esp+disp+8] */
+    emit8(0xD9); emit8(0x2C); emit8(0x24);                         /* fldcw [esp]    -> restore */
+    emit8(0x83); emit8(0xC4); emit8(0x08);                         /* add esp, 8 */
 }
 
 static Type *gen_expr(Node *n);
@@ -1777,6 +2159,9 @@ static void emit_load_from_addr(Type *ty) {
         else { emit8(0x0F); emit8(0xBE); emit8(0x00); } /* movsx eax, byte [eax] */
     } else if (is_bool(ty)) {
         emit8(0x0F); emit8(0xB6); emit8(0x00); /* movzx eax, byte [eax] */
+    } else if (is_short(ty)) {
+        if (is_unsigned_type(ty)) { emit8(0x0F); emit8(0xB7); emit8(0x00); } /* movzx eax, word [eax] */
+        else { emit8(0x0F); emit8(0xBF); emit8(0x00); }                      /* movsx eax, word [eax] */
     } else {
         emit8(0x8B); emit8(0x00); /* mov eax, [eax] */
     }
@@ -1788,6 +2173,8 @@ static void emit_store_to_addr(Type *ty) {
     emit_pop_ebx(); /* addr */
     if (is_byte(ty)) {
         emit8(0x88); emit8(0x03); /* mov [ebx], al */
+    } else if (is_short(ty)) {
+        emit8(0x66); emit8(0x89); emit8(0x03); /* mov [ebx], ax */
     } else {
         emit8(0x89); emit8(0x03); /* mov [ebx], eax */
     }
@@ -1826,6 +2213,43 @@ static void gen_args_rev(Node *n) {
     for (int i = n->argc - 1; i >= 0; i--) gen_expr(n->args[i]);
 }
 
+/* Structs by value.
+ *
+ * The convention is that a struct-valued expression leaves its ADDRESS on the
+ * stack rather than its contents; only the points that actually need the bytes
+ * (assignment and argument passing) copy them.  That keeps the existing
+ * stack-machine codegen intact -- every other expression form still deals in
+ * 4-byte stack slots.
+ *
+ * Copies use rep movsb, which clobbers esi/edi/ecx.  Safe here because values
+ * live on the stack between sub-expressions, never in registers. */
+static void emit_struct_copy(int size) {
+    /* stack: [dst][src], top is src.  Leaves [dst] as the result. */
+    emit8(0x5E);                                  /* pop esi  <- src */
+    emit8(0x5F);                                  /* pop edi  <- dst */
+    emit8(0x57);                                  /* push edi -> result */
+    emit8(0xB9); emit32((uint32_t)size);          /* mov ecx, size */
+    emit8(0xFC);                                  /* cld */
+    emit8(0xF3); emit8(0xA4);                     /* rep movsb */
+}
+
+/* Expand a struct argument: its address is on the stack, and the callee wants
+ * the bytes themselves. */
+static void emit_struct_push(int size) {
+    int slot = (size + 3) & ~3;
+    emit8(0x5E);                                  /* pop esi <- src */
+    emit_add_esp(-slot);                          /* make room */
+    emit8(0x89); emit8(0xE7);                     /* mov edi, esp */
+    emit8(0xB9); emit32((uint32_t)size);          /* mov ecx, size */
+    emit8(0xFC);                                  /* cld */
+    emit8(0xF3); emit8(0xA4);                     /* rep movsb */
+}
+
+static int arg_slot_bytes(Type *t) {
+    if (is_record(t)) return (type_size(t) + 3) & ~3;
+    return 4;
+}
+
 static Type *gen_call(Node *n) {
     if (!strcmp(n->name, "syscall")) {
         if (n->argc < 1 || n->argc > 4) { puts("syscall args\n"); sys_exit(1); }
@@ -1859,10 +2283,19 @@ static Type *gen_call(Node *n) {
     if (!strcmp(n->name, "sys_gfx_fbinfo")) { if (n->argc != 2) { puts("sys_gfx_fbinfo args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(29, 2); }
     if (!strcmp(n->name, "sys_vbemodes")) { if (n->argc != 2) { puts("sys_vbemodes args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(22, 2); }
     if (!strcmp(n->name, "sys_keystate")) { if (n->argc != 1) { puts("sys_keystate args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(30, 1); }
-    if (!strcmp(n->name, "sys_udp_send")) { if (n->argc != 4) { puts("sys_udp_send args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(31, 4); }
-    if (!strcmp(n->name, "sys_udp_recv")) { if (n->argc != 4) { puts("sys_udp_recv args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(32, 4); }
-    if (!strcmp(n->name, "sys_net_myip"))    { if (n->argc != 0) { puts("sys_net_myip args\n");    sys_exit(1); } return emit_syscall_builtin(33, 0); }
-    if (!strcmp(n->name, "sys_udp_recv_nb")) { if (n->argc != 4) { puts("sys_udp_recv_nb args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(34, 4); }
+    if (!strcmp(n->name, "sys_getcwd")) { if (n->argc != 2) { puts("sys_getcwd args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(35, 2); }
+    if (!strcmp(n->name, "sys_setcwd")) { if (n->argc != 1) { puts("sys_setcwd args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(36, 1); }
+    if (!strcmp(n->name, "sys_poweroff")) { if (n->argc != 0) { puts("sys_poweroff args\n"); sys_exit(1); } return emit_syscall_builtin(37, 0); }
+    if (!strcmp(n->name, "sys_meminfo")) { if (n->argc != 2) { puts("sys_meminfo args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(38, 2); }
+    if (!strcmp(n->name, "sys_storage")) { if (n->argc != 2) { puts("sys_storage args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(39, 2); }
+    if (!strcmp(n->name, "sys_sync")) { if (n->argc != 0) { puts("sys_sync args\n"); sys_exit(1); } return emit_syscall_builtin(40, 0); }
+    if (!strcmp(n->name, "sys_io_in")) { if (n->argc != 2) { puts("sys_io_in args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(41, 2); }
+    if (!strcmp(n->name, "sys_io_out")) { if (n->argc != 3) { puts("sys_io_out args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(42, 3); }
+    if (!strcmp(n->name, "sys_pci_read")) { if (n->argc != 2) { puts("sys_pci_read args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(43, 2); }
+    if (!strcmp(n->name, "sys_pci_write")) { if (n->argc != 3) { puts("sys_pci_write args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(44, 3); }
+    if (!strcmp(n->name, "sys_map_phys")) { if (n->argc != 3) { puts("sys_map_phys args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(45, 3); }
+    if (!strcmp(n->name, "sys_dma_alloc")) { if (n->argc != 2) { puts("sys_dma_alloc args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(46, 2); }
+    if (!strcmp(n->name, "sys_irq_wait")) { if (n->argc != 2) { puts("sys_irq_wait args\n"); sys_exit(1); } gen_args_rev(n); return emit_syscall_builtin(47, 2); }
     if (!strcmp(n->name, "va_start")) {
         if (n->argc != 2) { puts("va_start args\n"); sys_exit(1); }
         if (n->args[0]->kind != ND_VAR || n->args[1]->kind != ND_VAR) { puts("va_start lvalue\n"); sys_exit(1); }
@@ -1905,6 +2338,8 @@ static Type *gen_call(Node *n) {
             gen_expr(n->callee);
             emit_pop_eax();
             emit8(0xFF); emit8(0xD0); /* call eax */
+            /* indirect calls have no parameter types, so every argument is a
+             * plain 4-byte slot -- structs by value need a known prototype */
             if (n->argc > 0) emit_add_esp(4 * n->argc);
             emit_push_eax();
             return &type_int;
@@ -1925,19 +2360,35 @@ static Type *gen_call(Node *n) {
             if (n->argc != f->param_count) { error_here("wrong number of arguments"); }
         }
     }
+    int argbytes = 0;
     for (int i = n->argc - 1; i >= 0; i--) {
         Type *t = gen_expr(n->args[i]);
-        Type *pt = (i < f->param_count) ? f->params[i] : &type_int;
-        if (is_record(pt) || is_array(pt)) { puts("param struct/array\n"); sys_exit(1); }
-        if (is_float(pt) && !is_float(t)) conv_stack_to_float(0);
-        if (!is_float(pt) && is_float(t)) conv_stack_to_int(0);
+        /* Arguments past the prototype are varargs: pass them through
+         * untouched.  They used to be forced to int, which silently destroyed
+         * a float before printf could ever see its bits. */
+        int vararg = (i >= f->param_count);
+        Type *pt = vararg ? &type_int : f->params[i];
+        if (is_array(pt)) { puts("param struct/array\n"); sys_exit(1); }
+        if (is_record(pt)) {
+            if (!is_record(t) || type_size(t) != type_size(pt)) {
+                puts("struct arg type\n"); sys_exit(1);
+            }
+            emit_struct_push(type_size(pt));
+            argbytes += arg_slot_bytes(pt);
+            continue;
+        }
+        if (!vararg) {
+            if (is_float(pt) && !is_float(t)) conv_stack_to_float(0);
+            if (!is_float(pt) && is_float(t)) conv_stack_to_int(0);
+        }
+        argbytes += 4;
     }
     emit8(0xE8);
     int pos = code_len;
     emit32(0);
     const char *lname = f->link_name[0] ? f->link_name : n->name;
     add_sym_fix(pos, RELOC_REL32, lname);
-    if (n->argc > 0) emit_add_esp(4 * n->argc);
+    if (argbytes > 0) emit_add_esp(argbytes);
     if (is_float(f->ret)) {
         emit_add_esp(-4);
         emit8(0xD9); emit8(0x1C); emit8(0x24); /* fstp dword [esp] */
@@ -1998,7 +2449,7 @@ static Type *gen_addr(Node *n) {
         }
         if (!is_record(bt)) { puts("member struct\n"); sys_exit(1); }
         Field *f = find_field(bt->sdef, n->name);
-        if (!f) { puts("no field\n"); sys_exit(1); }
+        if (!f) { puts("no field: "); puts(n->name); putc('\n'); error_here("unknown member\n"); }
         emit_pop_eax();
         if (f->offset) { emit8(0x05); emit32((uint32_t)f->offset); }
         emit_push_eax();
@@ -2019,6 +2470,7 @@ static Type *gen_expr(Node *n) {
     case ND_STR: {
         int slen = strlen(n->name);
         int roff = rodata_len;
+        if (roff + slen + 1 > MAX_RODATA) { puts("rodata ovf\n"); sys_exit(1); }
         memcpy(rodata + roff, n->name, slen + 1);
         rodata_len += slen + 1;
         emit_mov_eax_imm(0);
@@ -2046,7 +2498,7 @@ static Type *gen_expr(Node *n) {
             emit_load_addr(s);
             return type_ptr(s->type->base);
         }
-        if (is_record(s->type)) { puts("struct rvalue\n"); sys_exit(1); }
+        if (is_record(s->type)) { emit_load_addr(s); return s->type; }
         emit_load_addr(s);
         emit_load_from_addr(s->type);
         return promote(s->type);
@@ -2057,7 +2509,10 @@ static Type *gen_expr(Node *n) {
     }
     case ND_DEREF: {
         Type *t = gen_addr(n);
-        if (is_record(t) || is_array(t)) { puts("struct rvalue\n"); sys_exit(1); }
+        /* A record or array value is represented by its address on this
+         * stack -- exactly what the ND_VAR case above leaves for a struct --
+         * so `*p` needs no load, and `s = *p` or `f(*p)` then work. */
+        if (is_record(t) || is_array(t)) return t;
         emit_load_from_addr(t);
         return promote(t);
     }
@@ -2067,13 +2522,21 @@ static Type *gen_expr(Node *n) {
         if (is_array(t)) {
             return type_ptr(t->base);
         }
-        if (is_record(t)) { puts("struct rvalue\n"); sys_exit(1); }
+        if (is_record(t)) return t;      /* address already on the stack */
         emit_load_from_addr(t);
         return promote(t);
     }
     case ND_ASSIGN: {
         Type *lt = gen_addr(n->lhs);
-        if (is_record(lt) || is_array(lt)) { puts("assign struct/array\n"); sys_exit(1); }
+        if (is_record(lt)) {
+            Type *rt = gen_expr(n->rhs);
+            if (!is_record(rt) || type_size(rt) != type_size(lt)) {
+                puts("struct assign type\n"); sys_exit(1);
+            }
+            emit_struct_copy(type_size(lt));
+            return lt;
+        }
+        if (is_array(lt)) { puts("assign struct/array\n"); sys_exit(1); }
         Type *rt = gen_expr(n->rhs);
         if (is_bool(lt)) {
             emit_boolify(rt);
@@ -2089,9 +2552,12 @@ static Type *gen_expr(Node *n) {
         Node *cond = n->args[0];
         Node *t = n->args[1];
         Node *f = n->args[2];
-        Type *tt = infer_type(t);
-        Type *tf = infer_type(f);
-        if (is_record(tt) || is_array(tt) || is_record(tf) || is_array(tf)) { puts("ternary type\n"); sys_exit(1); }
+        /* An array operand decays to a pointer, so `c ? "a" : "b"` is fine.
+         * A record would need the result copied somewhere, which this
+         * expression stack has no room for, so that stays rejected. */
+        Type *tt = decay_array(infer_type(t));
+        Type *tf = decay_array(infer_type(f));
+        if (is_record(tt) || is_record(tf)) { puts("ternary type\n"); sys_exit(1); }
         Type *ct = ternary_common_type(tt, tf);
         int l_false = new_label();
         int l_end = new_label();
@@ -2140,6 +2606,19 @@ static Type *gen_expr(Node *n) {
         } else {
             if (is_float(n->type) && !is_float(t)) conv_stack_to_float(0);
             if (!is_float(n->type) && is_float(t)) conv_stack_to_int(0);
+            /* A cast to a narrower integer has to truncate: values live in eax
+             * as 32 bits, so without this (uint8_t)300 would stay 300. */
+            if (is_short(n->type)) {
+                emit_pop_eax();
+                if (is_unsigned_type(n->type)) { emit8(0x0F); emit8(0xB7); emit8(0xC0); } /* movzx eax, ax */
+                else { emit8(0x0F); emit8(0xBF); emit8(0xC0); }                           /* movsx eax, ax */
+                emit_push_eax();
+            } else if (is_char(n->type)) {
+                emit_pop_eax();
+                if (is_unsigned_type(n->type)) { emit8(0x0F); emit8(0xB6); emit8(0xC0); } /* movzx eax, al */
+                else { emit8(0x0F); emit8(0xBE); emit8(0xC0); }                           /* movsx eax, al */
+                emit_push_eax();
+            }
         }
         return n->type;
     }
@@ -2183,6 +2662,23 @@ static Type *gen_expr(Node *n) {
         return t;
     }
     case ND_BIN: {
+        /* && and || must come before the operand emission below:
+         * gen_logical generates both operands itself (with short-circuit
+         * jumps), so emitting them here too left two extra values on the
+         * stack -- any `x = a && b` then stored through a garbage address. */
+        if (n->op=='A' || n->op=='O') {
+            int l_true = new_label();
+            int l_false = new_label();
+            gen_logical(n, l_true, l_false);
+            set_label(l_true);
+            emit8(0x68); emit32(1);
+            int l_end = new_label();
+            emit_jmp_label(l_end);
+            set_label(l_false);
+            emit8(0x68); emit32(0);
+            set_label(l_end);
+            return &type_int;
+        }
         Type *lt = gen_expr(n->lhs);
         Type *rt = gen_expr(n->rhs);
         lt = promote(decay_array(lt));
@@ -2197,20 +2693,6 @@ static Type *gen_expr(Node *n) {
         int is_cmp = (n->op=='<'||n->op=='>'||n->op=='l'||n->op=='g'||n->op=='='||n->op=='!');
         int is_u = is_unsigned_type(lt) || is_unsigned_type(rt);
         if (is_ptr(lt) || is_ptr(rt)) is_u = 1;
-
-        if (n->op=='A' || n->op=='O') {
-            int l_true = new_label();
-            int l_false = new_label();
-            gen_logical(n, l_true, l_false);
-            set_label(l_true);
-            emit8(0x68); emit32(1);
-            int l_end = new_label();
-            emit_jmp_label(l_end);
-            set_label(l_false);
-            emit8(0x68); emit32(0);
-            set_label(l_end);
-            return &type_int;
-        }
 
         if (n->op=='&' || n->op=='|' || n->op=='^' || n->op=='L' || n->op=='R' || n->op=='%') {
             if (is_float(lt) || is_float(rt) || is_ptr(lt) || is_ptr(rt)) { puts("bit op type\n"); sys_exit(1); }
@@ -2243,9 +2725,13 @@ static Type *gen_expr(Node *n) {
                 if (is_ptr(lt) || is_ptr(rt)) { puts("ptr cmp float\n"); sys_exit(1); }
                 if (!is_float(rt)) conv_stack_to_float(0);
                 if (!is_float(lt)) conv_stack_to_float(4);
-                emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04); /* fld [esp+4] */
-                emit8(0xD9); emit8(0x04); emit8(0x24); /* fld [esp] */
-                emit8(0xDE); emit8(0xD9); /* fcompp */
+                /* fcompp compares st(0) against st(1), so the left operand
+                 * must be loaded LAST.  Loading it first made every float
+                 * <, >, <= and >= evaluate reversed; == and != survived only
+                 * because equality is symmetric. */
+                emit8(0xD9); emit8(0x04); emit8(0x24);                  /* fld [esp]   -> rhs */
+                emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04);     /* fld [esp+4] -> lhs */
+                emit8(0xDE); emit8(0xD9); /* fcompp: lhs ? rhs */
                 emit8(0x9B); emit8(0xDF); emit8(0xE0); /* fstsw ax */
                 emit8(0x9E); /* sahf */
                 emit8(0x0F);
@@ -2406,6 +2892,184 @@ static void parse_storage_spec(DeclSpec *ds) {
     }
 }
 
+/* Copy a string literal into a stack array with immediate stores; the array
+ * is zero-filled past the text, as C requires. */
+static void emit_char_array_init(Sym *s, Type *ty, const char *text) {
+    int slen = strlen(text);
+    int total = type_size(ty);
+    emit_load_addr(s);
+    emit_pop_eax();               /* eax = &array */
+    for (int i = 0; i < total; i++) {
+        int b = (i < slen) ? (unsigned char)text[i] : 0;
+        emit8(0xC6); emit8(0x80); emit32((uint32_t)i); emit8((uint8_t)b); /* mov byte [eax+i], b */
+    }
+}
+
+/* ---- braced initialisers ---------------------------------------------
+ *
+ * The list is parsed once into (offset, type, expression) items, which lets
+ * globals and locals share the walk: a global writes the constants straight
+ * into .data, while a local emits a store per item.  Parsing before the
+ * storage is reserved is also what makes "int a[] = {1,2,3}" work, since the
+ * length is only known once the list has been counted.
+ *
+ * Nested aggregates need explicit braces -- brace elision, as in
+ * "int m[2][2] = {1,2,3,4}", is not supported.
+ */
+#define MAX_INIT_ITEMS 1024
+typedef struct { int off; Type *ty; Node *e; } InitItem;
+static InitItem init_items[MAX_INIT_ITEMS];
+static int init_item_len;
+static int init_span;        /* bytes covered, for "[]" length inference */
+
+static void parse_braced(Type *ty, int base);
+
+static void note_span(int end) { if (end > init_span) init_span = end; }
+
+static void parse_init_item(Type *ty, int off) {
+    if (tok.kind == TOK_LBRACE) { parse_braced(ty, off); return; }
+    Node *e = parse_assign();          /* not parse_expr: ',' separates items */
+    if (init_item_len >= MAX_INIT_ITEMS) { puts("init ovf\n"); sys_exit(1); }
+    init_items[init_item_len].off = off;
+    init_items[init_item_len].ty = ty;
+    init_items[init_item_len].e = e;
+    init_item_len++;
+    note_span(off + type_size(ty));
+}
+
+static void parse_braced(Type *ty, int base) {
+    expect(TOK_LBRACE);
+    if (consume(TOK_RBRACE)) { note_span(base + type_size(ty)); return; }
+
+    if (is_array(ty)) {
+        Type *et = ty->base;
+        int esz = type_size(et);
+        int i = 0;
+        for (;;) {
+            parse_init_item(et, base + i * esz);
+            i++;
+            if (consume(TOK_COMMA)) { if (tok.kind == TOK_RBRACE) break; continue; }
+            break;
+        }
+        expect(TOK_RBRACE);
+        if (ty->array_len > 0) note_span(base + type_size(ty));
+        return;
+    }
+
+    if (is_record(ty)) {
+        StructDef *sd = ty->sdef;
+        int i = 0;
+        for (;;) {
+            if (i >= sd->field_count) { puts("too many init\n"); sys_exit(1); }
+            Field *f = &sd->fields[i];
+            parse_init_item(f->type, base + f->offset);
+            i++;
+            if (consume(TOK_COMMA)) { if (tok.kind == TOK_RBRACE) break; continue; }
+            break;
+        }
+        expect(TOK_RBRACE);
+        note_span(base + type_size(ty));
+        return;
+    }
+
+    /* a scalar wrapped in braces: int x = { 5 } */
+    parse_init_item(ty, base);
+    expect(TOK_RBRACE);
+}
+
+/* Parse a whole initialiser and, for "[]", return the type with its length
+ * filled in from what the list covered. */
+static Type *parse_init_for(Type *ty) {
+    init_item_len = 0;
+    init_span = 0;
+    parse_braced(ty, 0);
+    if (is_array(ty) && ty->array_len == 0) {
+        int esz = type_size(ty->base);
+        if (esz <= 0) { puts("init elem size\n"); sys_exit(1); }
+        ty = type_array(ty->base, (init_span + esz - 1) / esz);
+    }
+    return ty;
+}
+
+/* Zero a stack slot: values are written over the top afterwards, so partial
+ * initialisers leave the remainder zeroed the way C requires. */
+static void emit_zero_slot(Sym *s, int size) {
+    if (size <= 0) return;
+    emit_load_addr(s);
+    emit_pop_eax();                                 /* eax = &slot */
+    int words = size / 4;
+    if (words > 0) {
+        emit8(0xB9); emit32((uint32_t)words);       /* mov ecx, words */
+        emit8(0x31); emit8(0xD2);                   /* xor edx, edx */
+        int top = code_len;
+        emit8(0x89); emit8(0x10);                   /* mov [eax], edx */
+        emit8(0x83); emit8(0xC0); emit8(0x04);      /* add eax, 4 */
+        emit8(0x49);                                /* dec ecx */
+        emit8(0x75);                                /* jnz top */
+        int dpos = code_len;
+        emit8((uint8_t)(top - (dpos + 1)));
+    }
+    for (int i = 0; i < size % 4; i++) {            /* trailing bytes */
+        emit8(0xC6); emit8(0x00); emit8(0x00);      /* mov byte [eax], 0 */
+        emit8(0x40);                                /* inc eax */
+    }
+}
+
+/* Emit the recorded items into a local. */
+static void emit_local_init_items(Sym *s) {
+    for (int i = 0; i < init_item_len; i++) {
+        InitItem *it = &init_items[i];
+        emit_load_addr(s);
+        if (it->off) {
+            emit_pop_eax();
+            emit8(0x05); emit32((uint32_t)it->off);  /* add eax, off */
+            emit_push_eax();
+        }
+        Type *rt = gen_expr(it->e);
+        if (is_bool(it->ty)) {
+            emit_boolify(rt);
+        } else {
+            if (is_float(it->ty) && !is_float(rt)) conv_stack_to_float(0);
+            if (!is_float(it->ty) && is_float(rt)) conv_stack_to_int(0);
+        }
+        emit_store_to_addr(it->ty);
+        emit_add_esp(4);
+    }
+}
+
+/* Named labels for goto.  Labels may be used before they are defined, so an
+ * entry is created on first mention and the existing label machinery resolves
+ * the forward jump. */
+#define MAX_GOTO_LABELS 64
+typedef struct { char name[32]; int label; int defined; int used; } GotoLabel;
+static GotoLabel goto_labels[MAX_GOTO_LABELS];
+static int goto_label_len;
+
+static GotoLabel *goto_label_find(const char *name) {
+    for (int i = 0; i < goto_label_len; i++)
+        if (!strcmp(goto_labels[i].name, name)) return &goto_labels[i];
+    if (goto_label_len >= MAX_GOTO_LABELS) { puts("label ovf\n"); sys_exit(1); }
+    GotoLabel *g = &goto_labels[goto_label_len++];
+    strncpy(g->name, name, 31);
+    g->name[31] = 0;
+    g->label = new_label();
+    g->defined = 0;
+    g->used = 0;
+    return g;
+}
+
+static void goto_labels_reset(void) { goto_label_len = 0; }
+
+static void goto_labels_check(void) {
+    for (int i = 0; i < goto_label_len; i++)
+        if (goto_labels[i].used && !goto_labels[i].defined) {
+            puts("undefined label: ");
+            puts(goto_labels[i].name);
+            putc('\n');
+            sys_exit(1);
+        }
+}
+
 static void parse_decl_stmt(int expect_semi) {
     DeclSpec ds;
     parse_storage_spec(&ds);
@@ -2466,19 +3130,56 @@ static void parse_decl_stmt(int expect_semi) {
             int gidx = (int)(gs - globals);
             add_local_alias(name, ty, gidx);
         } else {
+            /* Consume '=' first so the initialiser can decide the array's
+             * length before the stack slot is reserved -- no lookahead, which
+             * would have to save and restore all of the lexer's state. */
+            int has_init = (tok.kind == TOK_ASSIGN);
+            if (has_init) next_token();
+
+            if (has_init && is_array(ty) && is_char(ty->base) && tok.kind == TOK_STR) {
+                if (ty->array_len == 0)                      /* char buf[] = "..." */
+                    ty = type_array(ty->base, strlen(tok.text) + 1);
+                Sym *sa = add_local(name, ty);
+                emit_char_array_init(sa, ty, tok.text);
+                next_token();
+                if (consume(TOK_COMMA)) continue;
+                if (expect_semi) expect(TOK_SEMI);
+                break;
+            }
+
+            if (has_init && tok.kind == TOK_LBRACE) {
+                ty = parse_init_for(ty);
+                Sym *sb = add_local(name, ty);
+                emit_zero_slot(sb, type_size(ty));
+                emit_local_init_items(sb);
+                if (consume(TOK_COMMA)) continue;
+                if (expect_semi) expect(TOK_SEMI);
+                break;
+            }
+
             Sym *s = add_local(name, ty);
-            if (consume(TOK_ASSIGN)) {
-                if (is_array(ty) || is_record(ty)) { puts("init array/struct\n"); sys_exit(1); }
+            if (has_init) {
+                if (is_array(ty)) { puts("init array\n"); sys_exit(1); }
                 Node *e = parse_expr();
                 emit_load_addr(s);
                 Type *t = gen_expr(e);
-                if (is_bool(ty)) {
-                    emit_boolify(t);
+                if (is_record(ty)) {
+                    /* `Token save = tok;` -- the same copy `save = tok;` does.
+                     * Initialising a struct from an expression was rejected
+                     * even though assigning one was already supported. */
+                    if (!is_record(t) || type_size(t) != type_size(ty)) {
+                        puts("struct init type\n"); sys_exit(1);
+                    }
+                    emit_struct_copy(type_size(ty));
                 } else {
-                    if (is_float(ty) && !is_float(t)) conv_stack_to_float(0);
-                    if (!is_float(ty) && is_float(t)) conv_stack_to_int(0);
+                    if (is_bool(ty)) {
+                        emit_boolify(t);
+                    } else {
+                        if (is_float(ty) && !is_float(t)) conv_stack_to_float(0);
+                        if (!is_float(ty) && is_float(t)) conv_stack_to_int(0);
+                    }
+                    emit_store_to_addr(ty);
                 }
-                emit_store_to_addr(ty);
                 emit_add_esp(4);
             }
             if (consume(TOK_COMMA)) continue;
@@ -2549,7 +3250,14 @@ static void gen_return(Node *e) {
 
 static void gen_stmt(void) {
     if (consume(TOK_LBRACE)) {
+        /* Names declared in this block go out of scope at its end.  Only the
+         * count is restored, not local_offset, so the slots are never reused
+         * and the frame size (-local_offset at the end of the function) stays
+         * right -- reusing them would need liveness analysis this compiler
+         * does not do. */
+        int saved = locals_len;
         while (!consume(TOK_RBRACE)) gen_stmt();
+        locals_len = saved;
         return;
     }
     if (consume(TOK_RETURN)) {
@@ -2586,6 +3294,63 @@ static void gen_stmt(void) {
         set_label(l_end);
         return;
     }
+    if (consume(TOK_DO)) {
+        int l_top = new_label();
+        int l_cont = new_label();   /* continue lands on the condition test */
+        int l_end = new_label();
+        set_label(l_top);
+        break_stack[break_depth].break_label = l_end;
+        break_stack[break_depth].continue_label = l_cont;
+        break_depth++;
+        gen_stmt();
+        break_depth--;
+        set_label(l_cont);
+        expect(TOK_WHILE);
+        expect(TOK_LPAREN);
+        int cond_pos = tok.pos;
+        Node *cond = parse_expr();
+        int cond_end = tok.pos;
+        expect(TOK_RPAREN);
+        expect(TOK_SEMI);
+        int l_exit = new_label();
+        diag_ovr_pos = cond_pos; diag_ovr_end = cond_end;
+        gen_cond(cond, l_exit);     /* falls through when true */
+        diag_ovr_end = 0;
+        emit_jmp_label(l_top);
+        set_label(l_exit);
+        set_label(l_end);
+        return;
+    }
+    if (consume(TOK_GOTO)) {
+        if (tok.kind != TOK_ID) { error_here("goto label\n"); }
+        GotoLabel *g = goto_label_find(tok.text);
+        g->used = 1;
+        next_token();
+        expect(TOK_SEMI);
+        emit_jmp_label(g->label);
+        return;
+    }
+    /* "name:" is a label.  A statement can only start with an identifier
+     * followed by ':' in that one case, so one token of lookahead settles it. */
+    if (tok.kind == TOK_ID) {
+        int save_pos = pos;
+        Token save_tok = tok;
+        char lname[32];
+        strncpy(lname, tok.text, 31);
+        lname[31] = 0;
+        next_token();
+        if (tok.kind == TOK_COLON) {
+            next_token();
+            GotoLabel *g = goto_label_find(lname);
+            if (g->defined) { puts("duplicate label\n"); sys_exit(1); }
+            g->defined = 1;
+            set_label(g->label);
+            gen_stmt();
+            return;
+        }
+        pos = save_pos;
+        tok = save_tok;
+    }
     if (consume(TOK_WHILE)) {
         int l_start = new_label();
         int l_end = new_label();
@@ -2593,7 +3358,9 @@ static void gen_stmt(void) {
         expect(TOK_LPAREN);
         Node *cond = parse_expr();
         expect(TOK_RPAREN);
-        break_stack[break_depth++] = (BreakCtx){ l_end, l_start };
+        break_stack[break_depth].break_label = l_end;
+        break_stack[break_depth].continue_label = l_start;
+        break_depth++;
         gen_cond(cond, l_end);
         gen_stmt();
         break_depth--;
@@ -2602,6 +3369,9 @@ static void gen_stmt(void) {
         return;
     }
     if (consume(TOK_FOR)) {
+        /* A declaration in the init clause belongs to the loop, not to the
+         * enclosing function. */
+        int for_scope = locals_len;
         expect(TOK_LPAREN);
         if (dbg_for) debug_for_header();
         if (!consume(TOK_SEMI)) {
@@ -2616,23 +3386,39 @@ static void gen_stmt(void) {
         }
         if (dbg_for) { puts("for-after-init: "); print_tok_desc(); putc('\n'); }
         Node *cond = 0;
-        if (!consume(TOK_SEMI)) { cond = parse_expr(); expect(TOK_SEMI); }
+        int cond_pos = 0;
+        int cond_end = 0;
+        if (!consume(TOK_SEMI)) { cond_pos = tok.pos; cond = parse_expr(); cond_end = tok.pos; expect(TOK_SEMI); }
         if (dbg_for) { puts("for-after-cond: "); print_tok_desc(); putc('\n'); }
         Node *post = 0;
-        if (!consume(TOK_RPAREN)) { post = parse_expr(); expect(TOK_RPAREN); }
+        int post_pos = 0;
+        int post_end = 0;
+        if (!consume(TOK_RPAREN)) { post_pos = tok.pos; post = parse_expr(); post_end = tok.pos; expect(TOK_RPAREN); }
 
         int l_start = new_label();
         int l_end = new_label();
         int l_post = new_label();
         set_label(l_start);
-        if (cond) gen_cond(cond, l_end);
-        break_stack[break_depth++] = (BreakCtx){ l_end, l_post };
+        if (cond) {
+            diag_ovr_pos = cond_pos; diag_ovr_end = cond_end;
+            gen_cond(cond, l_end);
+            diag_ovr_end = 0;
+        }
+        break_stack[break_depth].break_label = l_end;
+        break_stack[break_depth].continue_label = l_post;
+        break_depth++;
         gen_stmt();
         break_depth--;
         set_label(l_post);
-        if (post) { gen_expr(post); emit_add_esp(4); }
+        if (post) {
+            diag_ovr_pos = post_pos; diag_ovr_end = post_end;
+            gen_expr(post);
+            diag_ovr_end = 0;
+            emit_add_esp(4);
+        }
         emit_jmp_label(l_start);
         set_label(l_end);
+        locals_len = for_scope;
         return;
     }
     if (consume(TOK_SWITCH)) {
@@ -2649,7 +3435,9 @@ static void gen_stmt(void) {
         emit_mov_membp_eax(temp_off);
         int dispatch = new_label();
         int end = new_label();
-        break_stack[break_depth++] = (BreakCtx){ end, -1 };
+        break_stack[break_depth].break_label = end;
+        break_stack[break_depth].continue_label = -1;
+        break_depth++;
         if (switch_depth >= 8) { puts("switch nest\n"); sys_exit(1); }
         SwitchCtx *sw = &switch_stack[switch_depth++];
         sw->end_label = end;
@@ -2661,18 +3449,14 @@ static void gen_stmt(void) {
         expect(TOK_LBRACE);
         while (!consume(TOK_RBRACE)) {
             if (consume(TOK_CASE)) {
+                /* Any integer constant expression, so `case ND_UNARY:` and
+                 * `case BASE + 1:` work, not just literals. */
                 int val = 0;
-                int neg = 0;
-                if (consume(TOK_MINUS)) neg = 1;
-                if (tok.kind == TOK_NUM || tok.kind == TOK_CHAR) {
-                    val = tok.ival;
-                    next_token();
-                } else {
-                    puts("case const\n"); sys_exit(1);
+                if (!eval_const(parse_cond(), &val)) {
+                    error_here("case label not constant\n");
                 }
-                if (neg) val = -val;
                 expect(TOK_COLON);
-                if (sw->case_count >= 64) { puts("case ovf\n"); sys_exit(1); }
+                if (sw->case_count >= MAX_CASE) { puts("case ovf\n"); sys_exit(1); }
                 int lbl = new_label();
                 set_label(lbl);
                 sw->case_values[sw->case_count] = val;
@@ -2716,7 +3500,10 @@ static void parse_function(Type *ret, const char *name) {
     /* deprecated */
 }
 
-static ParamInfo parse_param_list(void) {
+/* Fills *out rather than returning a ParamInfo: cc has no hidden-pointer ABI
+ * for returning a struct by value, and cc.c stays inside the language cc
+ * accepts so that it can compile itself. */
+static void parse_param_list(ParamInfo *out) {
     ParamInfo pi;
     memset(&pi, 0, sizeof(pi));
     expect(TOK_LPAREN);
@@ -2743,8 +3530,9 @@ static ParamInfo parse_param_list(void) {
                     char pname[32];
                     Type *pty = parse_declarator(pt, pname);
                     if (is_array(pty)) pty = type_ptr(pty->base);
-                    if (is_record(pty)) { error_here("param struct\n"); }
-                    if (pi.count >= 8) { puts("param ovf\n"); sys_exit(1); }
+                    /* struct parameters are passed by value: the caller copies
+                     * the bytes onto the stack and the callee gets its own */
+                    if (pi.count >= MAX_PARAM) { puts("param ovf\n"); sys_exit(1); }
                     strncpy(pi.names[pi.count], pname, 31);
                     pi.types[pi.count] = pty;
                     pi.count++;
@@ -2758,7 +3546,7 @@ static ParamInfo parse_param_list(void) {
             }
         }
     }
-    return pi;
+    *out = pi;
 }
 
 static void add_func_decl(Type *ret, const char *name, ParamInfo *pi, int is_static) {
@@ -2788,9 +3576,10 @@ static void parse_function_def(Type *ret, const char *name, ParamInfo *pi, int i
     strncpy(current_func_name, name, 31);
     current_func_name[31] = 0;
 
+    int poff = 8;
     for (int i = 0; i < pi->count; i++) {
-        int offset = 8 + i * 4;
-        add_param(pi->names[i], pi->types[i], offset);
+        add_param(pi->names[i], pi->types[i], poff);
+        poff += arg_slot_bytes(pi->types[i]);   /* a struct spans several slots */
     }
 
     set_label(f->label);
@@ -2799,6 +3588,12 @@ static void parse_function_def(Type *ret, const char *name, ParamInfo *pi, int i
     emit8(0x89); emit8(0xE5); /* mov ebp, esp */
     emit8(0x81); emit8(0xEC); int patch = code_len; emit32(0); /* sub esp, imm */
 
+    /* Returning a struct by value would need a hidden-pointer ABI, which is
+     * not implemented.  Reject it explicitly: struct expressions now evaluate
+     * to an address, so without this check "return s;" would quietly hand the
+     * caller a pointer where it expects the struct. */
+    if (is_record(ret)) { puts("ret struct unsupported\n"); sys_exit(1); }
+    goto_labels_reset();
     current_ret = ret;
     int epilogue = new_label();
     current_epilogue_label = epilogue;
@@ -2825,14 +3620,66 @@ static void parse_function_def(Type *ret, const char *name, ParamInfo *pi, int i
     code[patch+2] = (uint8_t)((stack_size >> 16) & 0xFF);
     code[patch+3] = (uint8_t)((stack_size >> 24) & 0xFF);
     current_epilogue_label = -1;
+    goto_labels_check();   /* every 'goto' must name a label that exists */
     in_func = 0;
 }
 
-static void parse_global(Type *ty, const char *name, int is_static) {
+/* Write the recorded items into .data.  Globals must be constants, so this
+ * accepts only literals -- and a string literal becomes a relocation, the same
+ * mechanism a plain "const char *p = ..." global uses. */
+static void store_global_init_items(Sym *s) {
+    for (int i = 0; i < init_item_len; i++) {
+        InitItem *it = &init_items[i];
+        int off = s->offset + it->off;
+        int sz = type_size(it->ty);
+        Node *e = it->e;
+        if (e->kind == ND_NUM) {
+            unsigned int v = (unsigned int)e->ival;
+            for (int b = 0; b < sz && b < 4; b++) data_seg[off + b] = (uint8_t)((v >> (8 * b)) & 0xFF);
+        } else if (e->kind == ND_FNUM) {
+            union { float f; uint32_t u; } u; u.f = e->fval;
+            for (int b = 0; b < 4; b++) data_seg[off + b] = (uint8_t)((u.u >> (8 * b)) & 0xFF);
+        } else if (e->kind == ND_STR) {
+            int slen = strlen(e->name);
+            int roff = rodata_len;
+            memcpy(rodata + roff, e->name, slen + 1);
+            rodata_len += slen + 1;
+            data_seg[off+0] = 0; data_seg[off+1] = 0;
+            data_seg[off+2] = 0; data_seg[off+3] = 0;
+            add_addr_fix(off, AF_STR_DATA, roff);
+        } else {
+            puts("global init\n"); sys_exit(1);
+        }
+    }
+}
+
+/* A declaration may list several declarators sharing one base type:
+ * `static Type type_int, type_float, type_char;`.  Returns 1 when a comma
+ * followed, meaning the caller should parse another declarator. */
+static int end_of_declarator(void) {
+    if (consume(TOK_COMMA)) return 1;
+    expect(TOK_SEMI);
+    return 0;
+}
+
+static int parse_global(Type *ty, const char *name, int is_static) {
     Sym *exist = find_global(name);
     if (exist && !exist->is_extern) { puts("dup global\n"); sys_exit(1); }
     if (exist && is_static) { puts("extern/static\n"); sys_exit(1); }
     if (consume(TOK_ASSIGN)) {
+        /* braced initialiser: parse it first, since "[]" takes its length
+         * from what the list covers */
+        if (tok.kind == TOK_LBRACE) {
+            ty = parse_init_for(ty);
+            Sym *sb = exist ? define_global_data_existing(exist, ty) : add_global_data(name, ty);
+            if (is_static) sym_set_link_name(sb, 1);
+            store_global_init_items(sb);
+            return end_of_declarator();
+        }
+
+        /* char x[] = "..."  -- size comes from the literal, NUL included */
+        if (is_array(ty) && ty->array_len == 0 && is_char(ty->base) && tok.kind == TOK_STR)
+            ty = type_array(ty->base, strlen(tok.text) + 1);
         Sym *s = exist ? define_global_data_existing(exist, ty) : add_global_data(name, ty);
         if (is_static) sym_set_link_name(s, 1);
         if (is_array(ty)) {
@@ -2843,7 +3690,18 @@ static void parse_global(Type *ty, const char *name, int is_static) {
             next_token();
         } else {
             Node *e = parse_expr();
-            if (e->kind == ND_NUM) {
+            if (e->kind == ND_STR) {
+                /* const char *p = "..." : park the text in rodata and leave a
+                 * relocation so the linker writes its address into .data. */
+                int slen2 = strlen(e->name);
+                int roff = rodata_len;
+                if (roff + slen2 + 1 > MAX_RODATA) { puts("rodata ovf\n"); sys_exit(1); }
+                memcpy(rodata + roff, e->name, slen2 + 1);
+                rodata_len += slen2 + 1;
+                data_seg[s->offset+0] = 0; data_seg[s->offset+1] = 0;
+                data_seg[s->offset+2] = 0; data_seg[s->offset+3] = 0;
+                add_addr_fix(s->offset, AF_STR_DATA, roff);
+            } else if (e->kind == ND_NUM) {
                 int v = e->ival;
                 data_seg[s->offset+0] = (uint8_t)(v & 0xFF);
                 data_seg[s->offset+1] = (uint8_t)((v>>8) & 0xFF);
@@ -2856,20 +3714,34 @@ static void parse_global(Type *ty, const char *name, int is_static) {
                 data_seg[s->offset+2] = (uint8_t)((u.u>>16) & 0xFF);
                 data_seg[s->offset+3] = (uint8_t)((u.u>>24) & 0xFF);
             } else {
-                puts("global init\n"); sys_exit(1);
+                /* Anything the constant folder can reduce: `= MAX / 2`,
+                 * `= sizeof(T)`, `= A | B`.  A global has to be initialised
+                 * before main runs, so nothing else is allowed here. */
+                int cv = 0;
+                if (!eval_const(e, &cv)) { error_here("global init not constant\n"); }
+                data_seg[s->offset+0] = (uint8_t)(cv & 0xFF);
+                data_seg[s->offset+1] = (uint8_t)((cv>>8) & 0xFF);
+                data_seg[s->offset+2] = (uint8_t)((cv>>16) & 0xFF);
+                data_seg[s->offset+3] = (uint8_t)((cv>>24) & 0xFF);
             }
         }
-        expect(TOK_SEMI);
-        return;
+        return end_of_declarator();
     }
     Sym *s = exist ? define_global_bss_existing(exist, ty) : add_global_bss(name, ty);
     if (is_static) sym_set_link_name(s, 1);
-    expect(TOK_SEMI);
+    return end_of_declarator();
 }
 
 static void parse_program(void) {
     next_token();
     while (tok.kind != TOK_EOF) {
+        /* Codegen is single-pass, and neither Sym nor Func keeps a Node*, so
+         * every node made for the previous construct is dead by now.  Reusing
+         * the pool per top-level declaration is what lets MAX_NODE be sized
+         * for the largest single function instead of the whole file -- a 4500
+         * line source needs tens of thousands of nodes otherwise, at 260
+         * bytes each. */
+        node_len = 0;
         DeclSpec ds;
         parse_storage_spec(&ds);
         if (ds.is_static && ds.is_extern) { error_here("static/extern\n"); }
@@ -2890,25 +3762,31 @@ static void parse_program(void) {
         Type *base = parse_type_spec();
         if (!base) { error_here("type?\n"); }
         if (tok.kind == TOK_SEMI) { next_token(); continue; }
-        char name[32];
-        Type *ty = parse_declarator(base, name);
-        if (tok.kind == TOK_LPAREN) {
-            if (is_array(ty) || is_record(ty)) { error_here("func return\n"); }
-            ParamInfo pi = parse_param_list();
-            if (tok.kind == TOK_SEMI) {
-                next_token();
-                add_func_decl(ty, name, &pi, ds.is_static);
-            } else {
+
+        for (;;) {
+            char name[32];
+            Type *ty = parse_declarator(base, name);
+            if (tok.kind == TOK_LPAREN) {
+                if (is_array(ty) || is_record(ty)) { error_here("func return\n"); }
+                ParamInfo pi;
+                parse_param_list(&pi);
+                if (tok.kind == TOK_SEMI || tok.kind == TOK_COMMA) {
+                    add_func_decl(ty, name, &pi, ds.is_static);
+                    if (end_of_declarator()) continue;
+                    break;
+                }
+                /* A body ends the declaration; no comma list can follow. */
                 parse_function_def(ty, name, &pi, ds.is_static);
+                break;
             }
-        } else {
             if (is_extern) {
                 if (consume(TOK_ASSIGN)) { puts("extern init\n"); sys_exit(1); }
                 add_global_decl(name, ty);
-                expect(TOK_SEMI);
-            } else {
-                parse_global(ty, name, ds.is_static);
+                if (end_of_declarator()) continue;
+                break;
             }
+            if (parse_global(ty, name, ds.is_static)) continue;
+            break;
         }
     }
 }
@@ -2943,7 +3821,7 @@ static int build_elf(uint8_t *out, int out_max,
     *(uint16_t*)(p+16)=2;
     *(uint16_t*)(p+18)=3;
     *(uint32_t*)(p+20)=1;
-    *(uint32_t*)(p+24)=header; /* entry */
+    *(uint32_t*)(p+24)=LINK_BASE + header; /* entry */
     *(uint32_t*)(p+28)=ehdr;
     *(uint32_t*)(p+32)=0;
     *(uint32_t*)(p+36)=0;
@@ -2957,8 +3835,8 @@ static int build_elf(uint8_t *out, int out_max,
     p += ehdr;
     *(uint32_t*)(p+0)=1;
     *(uint32_t*)(p+4)=0;
-    *(uint32_t*)(p+8)=0;
-    *(uint32_t*)(p+12)=0;
+    *(uint32_t*)(p+8)=LINK_BASE;
+    *(uint32_t*)(p+12)=LINK_BASE;
     *(uint32_t*)(p+16)=file_sz;
     *(uint32_t*)(p+20)=file_sz + bss_len;
     *(uint32_t*)(p+24)=7;
@@ -3063,7 +3941,10 @@ static int pp_macro_value(Preproc *pp, const char *name) {
     Macro *m = &pp->macros[idx];
     const char *b = m->body;
     int v = 0;
-    if (pp_expr_number(&(PPExpr){ b, pp }, &v)) return v;
+    PPExpr e;
+    e.p = b;
+    e.pp = pp;
+    if (pp_expr_number(&e, &v)) return v;
     return 1;
 }
 
@@ -3340,6 +4221,33 @@ static int pp_expand_text(Preproc *pp, const char *in, char *out, int out_max, i
     return out_len;
 }
 
+/* Quoted includes search the including file's directory, then the working
+ * directory, then the root.  Angle-bracket includes are root-only.  On
+ * success `resolved` holds the path that worked, so nested includes inside
+ * that file resolve against its directory rather than the top-level one. */
+static int load_include(const char *name, const char *from_file, int quoted,
+                        char *buf, int max, char *resolved, int resolved_sz) {
+    if (quoted) {
+        char dir[PATH_MAX_LEN];
+        path_dir(from_file ? from_file : "", dir, sizeof(dir));
+        if (dir[0] && path_fs(dir, name, resolved, resolved_sz)) {
+            int n = sys_load(resolved, buf, max);
+            if (n > 0) return n;
+        }
+        if (cwd_get()[0] && path_fs(cwd_get(), name, resolved, resolved_sz)) {
+            int n = sys_load(resolved, buf, max);
+            if (n > 0) return n;
+        }
+    }
+    if (path_fs("", name, resolved, resolved_sz)) {
+        int n = sys_load(resolved, buf, max);
+        if (n > 0) return n;
+    }
+    /* system headers live in /lib, so <stdio.h> works from anywhere */
+    if (!path_fs("lib", name, resolved, resolved_sz)) return -1;
+    return sys_load(resolved, buf, max);
+}
+
 static int pp_process(Preproc *pp, const char *in, const char *filename, char *out, int out_max, int depth, int skip_stdio) {
     if (depth >= PP_MAX_DEPTH) { puts("include depth\n"); return -1; }
     int out_len = 0;
@@ -3380,10 +4288,12 @@ static int pp_process(Preproc *pp, const char *in, const char *filename, char *o
                     if (skip_stdio && !strcmp(name, "stdio.c")) { line++; continue; }
                     if (depth + 1 >= PP_MAX_DEPTH) { puts("include depth\n"); return -1; }
                     char *incbuf = incbuf_pool[depth + 1];
-                    int n = sys_load(name, incbuf, INC_BUF_MAX - 1);
-                    if (n <= 0) { puts("include fail\n"); return -1; }
+                    char incpath[PATH_MAX_LEN];
+                    int n = load_include(name, filename, end == '\"', incbuf,
+                                         INC_BUF_MAX - 1, incpath, sizeof(incpath));
+                    if (n <= 0) { puts("include fail: "); puts(name); putc('\n'); return -1; }
                     incbuf[n] = 0;
-                    int n2 = pp_process(pp, incbuf, name, out + out_len, out_max - out_len - 1, depth + 1, skip_stdio);
+                    int n2 = pp_process(pp, incbuf, incpath, out + out_len, out_max - out_len - 1, depth + 1, skip_stdio);
                     if (n2 < 0) return -1;
                     out_len += n2;
                 }
@@ -3507,6 +4417,7 @@ static int pp_process(Preproc *pp, const char *in, const char *filename, char *o
             memcpy(out + out_len, expanded, elen);
             out_len += elen;
             out[out_len++] = '\n';
+            lm_add(filename, line);
         }
         line++;
     }
@@ -3549,13 +4460,28 @@ static int compile_obj(const char *srcname, Obj *obj, int skip_stdio) {
     static char ppbuf[PPBUF_MAX];
 
     int n = sys_load(srcname, srcbuf, sizeof(srcbuf) - 1);
-    if (n <= 0) { puts("read fail\n"); return -1; }
+    if (n <= 0 && strncmp(srcname, "lib/", 4)) {
+        /* a missing source falls back to /lib by basename, so `gfx.c`
+           finds lib/gfx.c from any working directory -- typing `gfx.c`
+           inside /demo resolves to demo/gfx.c, which does not exist */
+        static char libname[PATH_MAX_LEN];
+        strcpy(libname, "lib/");
+        strncpy(libname + 4, path_base(srcname), PATH_MAX_LEN - 5);
+        libname[PATH_MAX_LEN - 1] = 0;
+        n = sys_load(libname, srcbuf, sizeof(srcbuf) - 1);
+        if (n > 0) srcname = libname;
+    }
+    if (n <= 0) { puts("read fail: "); puts(srcname); putc('\n'); return -1; }
     srcbuf[n] = 0;
 
     strncpy(cur_file, srcname, 63);
     cur_file[63] = 0;
     current_unit_id = unit_counter++;
     static_sym_id = 0;
+
+    lm_count = 0;
+    lm_files_len = 0;
+    diag_ovr_end = 0;
 
     Preproc pp; memset(&pp, 0, sizeof(pp));
     int pn = pp_process(&pp, srcbuf, srcname, ppbuf, sizeof(ppbuf), 0, skip_stdio);
@@ -3594,6 +4520,13 @@ static int compile_obj(const char *srcname, Obj *obj, int skip_stdio) {
         if (f->defined) {
             int off = labels_pos[f->label];
             const char *lname = f->link_name[0] ? f->link_name : f->name;
+#ifdef HOST_DEBUG
+            if (f->link_name[0]) { puts("FUNC "); puts(lname); putc(' '); puts(f->name); putc('\n'); }
+            if (obj->text[off] != 0x55) {
+                puts("BADSYM "); puts(f->name); putc(' ');
+                print_dec(off); putc(' '); print_dec(f->label); putc('\n');
+            }
+#endif
             obj_add_sym(obj, lname, SEC_TEXT, off, 0, 1, 1);
         } else {
             const char *lname = f->link_name[0] ? f->link_name : f->name;
@@ -3614,8 +4547,16 @@ static int compile_obj(const char *srcname, Obj *obj, int skip_stdio) {
 
     for (int i = 0; i < addr_fix_len; i++) {
         int pos = addr_fix[i].pos;
-        if (addr_fix[i].kind == AF_STR) {
-            if (obj->lreloc_len >= MAX_FIX) { puts("reloc ovf\n"); return -1; }
+        if (addr_fix[i].kind == AF_STR_DATA) {
+            if (obj->lreloc_len >= MAX_RELOC) { puts("reloc ovf\n"); return -1; }
+            ObjRelocLoc *r = &obj->lreloc[obj->lreloc_len++];
+            r->section = SEC_DATA;          /* patch .data, not .text */
+            r->offset = pos;
+            r->type = RELOC_ABS32;
+            r->target_section = SEC_RODATA;
+            r->addend = addr_fix[i].index;
+        } else if (addr_fix[i].kind == AF_STR) {
+            if (obj->lreloc_len >= MAX_RELOC) { puts("reloc ovf\n"); return -1; }
             ObjRelocLoc *r = &obj->lreloc[obj->lreloc_len++];
             r->section = SEC_TEXT;
             r->offset = pos;
@@ -3623,7 +4564,7 @@ static int compile_obj(const char *srcname, Obj *obj, int skip_stdio) {
             r->target_section = SEC_RODATA;
             r->addend = addr_fix[i].index;
         } else if (addr_fix[i].kind == AF_GLOB) {
-            if (obj->sreloc_len >= MAX_FIX) { puts("reloc ovf\n"); return -1; }
+            if (obj->sreloc_len >= MAX_RELOC) { puts("reloc ovf\n"); return -1; }
             ObjRelocSym *r = &obj->sreloc[obj->sreloc_len++];
             r->section = SEC_TEXT;
             r->offset = pos;
@@ -3635,7 +4576,7 @@ static int compile_obj(const char *srcname, Obj *obj, int skip_stdio) {
     }
 
     for (int i = 0; i < sym_fix_len; i++) {
-        if (obj->sreloc_len >= MAX_FIX) { puts("reloc ovf\n"); return -1; }
+        if (obj->sreloc_len >= MAX_RELOC) { puts("reloc ovf\n"); return -1; }
         ObjRelocSym *r = &obj->sreloc[obj->sreloc_len++];
         r->section = SEC_TEXT;
         r->offset = sym_fix[i].pos;
@@ -3650,10 +4591,15 @@ static int compile_obj(const char *srcname, Obj *obj, int skip_stdio) {
 static void build_start_obj(Obj *obj) {
     memset(obj, 0, sizeof(*obj));
     int p = 0;
-    /* set FPU control word to truncate (C casts truncate toward zero) */
+    /* FPU control word 0x037F: round to nearest, all exceptions masked -- the
+     * IEEE default, and what every other C implementation gives you.  Casts
+     * chop by flipping the mode for the one instruction (conv_stack_to_int);
+     * setting chop here instead truncated every float operation in the
+     * program, so results came out up to an ulp low and overflow saturated to
+     * FLT_MAX where it should have produced inf. */
     obj->text[p++] = 0x83; obj->text[p++] = 0xEC; obj->text[p++] = 0x04; /* sub esp, 4 */
     obj->text[p++] = 0x66; obj->text[p++] = 0xC7; obj->text[p++] = 0x04; obj->text[p++] = 0x24; /* mov word [esp], imm16 */
-    obj->text[p++] = 0x7F; obj->text[p++] = 0x0F; /* 0x0F7F */
+    obj->text[p++] = 0x7F; obj->text[p++] = 0x03; /* 0x037F */
     obj->text[p++] = 0xD9; obj->text[p++] = 0x2C; obj->text[p++] = 0x24; /* fldcw [esp] */
     obj->text[p++] = 0x83; obj->text[p++] = 0xC4; obj->text[p++] = 0x04; /* add esp, 4 */
 
@@ -3726,8 +4672,8 @@ static int link_objects(Obj *objs, int obj_count,
     LinkSym syms[MAX_SYM * MAX_OBJ];
     int sym_len = 0;
     int header = 52 + 32;
-    int text_base = header;
-    int rodata_base = header + text_total;
+    int text_base = LINK_BASE + header;
+    int rodata_base = text_base + text_total;
     int data_base = rodata_base + rodata_total;
     int bss_base = data_base + data_total;
 
@@ -3740,6 +4686,9 @@ static int link_objects(Obj *objs, int obj_count,
                 else if (os->section == SEC_RODATA) addr = rodata_base + rodata_off[i] + os->value;
                 else if (os->section == SEC_DATA) addr = data_base + data_off[i] + os->value;
                 else if (os->section == SEC_BSS) addr = bss_base + bss_off[i] + os->value;
+#ifdef HOST_DEBUG
+                puts("SYM "); print_dec(addr); putc(' '); puts(os->name); putc('\n');
+#endif
                 int idx = link_find(syms, sym_len, os->name);
                 if (idx >= 0) {
                     if (syms[idx].defined) { puts("dup sym "); puts(os->name); puts("\n"); return -1; }
@@ -3765,6 +4714,15 @@ static int link_objects(Obj *objs, int obj_count,
     for (int i = 0; i < sym_len; i++) {
         if (!syms[i].defined) {
             if (is_builtin_sym(syms[i].name)) continue;
+            /* An unused prototype is not an error -- a header may declare
+               functions no linked source defines (libc.h declares atoi, which
+               lives in stdlib.c).  Only a reference to a missing definition
+               is fatal, and the reloc pass below also reports those. */
+            int used = 0;
+            for (int o = 0; o < obj_count && !used; o++)
+                for (int r = 0; r < objs[o].sreloc_len; r++)
+                    if (!strcmp(objs[o].sreloc[r].name, syms[i].name)) { used = 1; break; }
+            if (!used) continue;
             puts("undef "); puts(syms[i].name); puts("\n"); return -1;
         }
     }
@@ -3815,12 +4773,15 @@ static int link_objects(Obj *objs, int obj_count,
 int main(void) {
     char srcline[256];
     char outname[64];
-    static uint8_t outbuf[131072];
+    /* Sized to the kernel's FILE_BUF_MAX: an ELF bigger than this could be
+       saved but never executed, so there is no point emitting one. */
+    static uint8_t outbuf[1024*1024];
     static uint8_t text[MAX_OUT_TEXT];
     static uint8_t rodata_buf[MAX_OUT_RODATA];
     static uint8_t data_buf[MAX_OUT_DATA];
 
-    puts("cc v7 (syscall args fix)\n");
+    puts("cc v8 (relative paths)\n");
+    if (cwd_get()[0]) { puts("dir: /"); puts(cwd_get()); putc('\n'); }
     puts("source files: ");
     readline(srcline, sizeof(srcline));
     puts("output file: ");
@@ -3830,12 +4791,30 @@ int main(void) {
     int file_count = split_sources(srcline, files, MAX_OBJ);
     if (file_count <= 0) { puts("no input\n"); return 1; }
 
+    /* Names typed at the prompt are relative to the shell's cwd. */
+    for (int i = 0; i < file_count; i++) {
+        char full[PATH_MAX_LEN];
+        if (!path_fs(cwd_get(), files[i], full, sizeof(full))) {
+            puts("bad path: "); puts(files[i]); putc('\n');
+            return 1;
+        }
+        strncpy(files[i], full, 63);
+        files[i][63] = 0;
+    }
+
+    char outpath[PATH_MAX_LEN];
+    if (!path_fs(cwd_get(), outname, outpath, sizeof(outpath))) {
+        puts("bad output name\n");
+        return 1;
+    }
+
     warn_count = 0;
     cur_file[0] = 0;
 
+    /* Compare basenames: "src/stdio.c" is still the user's own stdio.c. */
     int has_stdio = 0;
     for (int i = 0; i < file_count; i++) {
-        if (!strcmp(files[i], "stdio.c")) has_stdio = 1;
+        if (!strcmp(path_base(files[i]), "stdio.c")) has_stdio = 1;
     }
 
     int obj_count = 0;
@@ -3843,13 +4822,13 @@ int main(void) {
     build_start_obj(&objs[obj_count++]);
 
     if (!has_stdio) {
-        if (compile_obj("stdio.c", &objs[obj_count++], 0) != 0) return 1;
+        if (compile_obj("lib/stdio.c", &objs[obj_count++], 0) != 0) return 1;
     }
 
     for (int i = 0; i < file_count; i++) {
         if (obj_count >= MAX_OBJ) { puts("too many files\n"); return 1; }
         int skip_stdio = 1;
-        if (!strcmp(files[i], "stdio.c")) skip_stdio = 0;
+        if (!strcmp(path_base(files[i]), "stdio.c")) skip_stdio = 0;
         if (compile_obj(files[i], &objs[obj_count++], skip_stdio) != 0) return 1;
     }
 
@@ -3859,7 +4838,7 @@ int main(void) {
     int outsz = build_elf(outbuf, sizeof(outbuf), text, text_len, rodata_buf, rodata_len, data_buf, data_len2, bss_len);
     if (outsz < 0) { puts("build fail\n"); return 1; }
 
-    if (sys_save(outname, outbuf, outsz) != 0) { puts("save fail\n"); return 1; }
+    if (sys_save(outpath, outbuf, outsz) != 0) { puts("save fail\n"); return 1; }
     if (warn_count > 0) {
         puts("warnings: ");
         print_dec(warn_count);

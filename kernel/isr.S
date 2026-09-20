@@ -1,6 +1,7 @@
 .code32
 .globl isr_stub_table
 .globl irq_stub_table
+.globl irq48
 .globl isr_common
 .globl irq_common
 .globl fault_handler
@@ -100,6 +101,11 @@ IRQ 44
 IRQ 45
 IRQ 46
 IRQ 47
+
+/* Local APIC timer.  Its own vector rather than sharing 0x20 with the PIT,
+ * because it must be acknowledged at the LAPIC and never at the 8259 -- an
+ * EOI to the PIC here could prematurely end an in-service keyboard IRQ. */
+IRQ 48
 
 irq_common:
     pusha

@@ -1,0 +1,180 @@
+mini-os32 GRAPHICS GUIDE                        type gfxguide.txt
+
+Compile any of the examples with:   cc
+  source files: myprog.c gfx.c
+  output file:  myprog
+Then:  run myprog
+gfx.c is NOT added automatically. stdio.c is.
+
+
+1. THE TWO WAYS TO DRAW
+------------------------------------------------------------------
+DIRECT (fast, what you want)
+  Ask the kernel to map the framebuffer into your address space and
+  write pixels straight into it. No copying.
+
+BLIT (simple, slower)
+  Keep your own buffer, call gfx_blit() to push the whole thing.
+  Only useful in 8-bpp modes.
+
+Direct is what demo/move.c uses. Prefer it.
+
+
+2. GETTING ON SCREEN
+------------------------------------------------------------------
+  #include <stdio.h>
+  #include <gfx.h>
+
+  int main() {
+      gfx_fbinfo_t fb;
+      if (gfx_fbinfo(&fb) < 0) { puts("no framebuffer\n"); return 1; }
+
+      char *screen = (char *)fb.user_addr;
+      ...draw...
+      gfx_mode(GFX_MODE_TEXT);      /* ALWAYS restore before exit */
+      return 0;
+  }
+
+gfx_fbinfo_t gives you:
+  w, h        pixels
+  pitch       BYTES per row -- NOT w, and NOT w*4. Always use pitch.
+  bpp         8 or 32
+  size        total bytes
+  user_addr   where the framebuffer is mapped in your program
+
+The single most common bug is computing y*w instead of y*pitch.
+On a 1920x1200 panel the pitch is often larger than the visible
+width, and rows will shear diagonally if you get this wrong.
+
+
+3. PIXELS
+------------------------------------------------------------------
+32-bpp -- one pixel is 4 bytes, blue green red unused:
+
+  void put32(char *fb, int pitch, int x, int y, int rgb) {
+      int off = y * pitch + x * 4;
+      fb[off + 0] = (char)(rgb & 0xFF);          /* blue  */
+      fb[off + 1] = (char)((rgb >> 8) & 0xFF);   /* green */
+      fb[off + 2] = (char)((rgb >> 16) & 0xFF);  /* red   */
+  }
+
+8-bpp -- one pixel is one palette index:
+
+  void put8(char *fb, int pitch, int x, int y, int c) {
+      fb[y * pitch + x] = (char)c;
+  }
+  gfx_set_palette(1, 255, 0, 0);   /* index 1 := red, 0..255 each */
+
+Always clip. Writing outside w/h corrupts the next row or faults:
+  if (x < 0 || y < 0 || x >= w || y >= h) return;
+
+Filling by rows is much faster than calling a pixel function, and
+in 32-bpp an int pointer moves 4 bytes at a time:
+  int *row = (int *)(fb + y * pitch);
+  for (int x = 0; x < w; x++) row[x] = rgb;
+
+
+4. MODES
+------------------------------------------------------------------
+  gfx_mode(GFX_MODE_TEXT)            back to the shell -- always do this
+  gfx_mode(GFX_MODE_320x200x256)     mode 13h, 8-bpp
+  gfx_mode(GFX_MODE_640x480x256)     VBE 0x101, 8-bpp
+  gfx_mode(GFX_MODE_1440x900x32)     VBE 0x180, 32-bpp
+
+On a UEFI boot the firmware has already chosen a mode and gfx_mode
+cannot change it -- there is no VBE BIOS to call. Do not assume a
+mode change succeeded: call gfx_fbinfo() afterwards and use what it
+reports, whatever you asked for.
+
+  run vbeprobe    lists the 8-bpp modes this machine offers (BIOS boot)
+
+
+5. INPUT
+------------------------------------------------------------------
+  sys_getkey()       blocks until a key, returns ASCII
+  sys_getkey_nb()    returns 0 immediately if nothing is waiting
+  sys_keystate(sc)   1 while that key is physically held down
+
+For anything that moves, use sys_keystate: it reports the key being
+held, so several can be down at once and there is no repeat delay.
+sys_getkey_nb only gives you one keypress at a time.
+
+  #include <stdio.h>          /* SC_* live here */
+  if (sys_keystate(SC_LEFT))  x--;
+  if (sys_keystate(SC_RIGHT)) x++;
+  if (sys_getkey_nb() == 27) break;      /* escape */
+
+  SC_UP SC_DOWN SC_LEFT SC_RIGHT SC_W SC_A SC_S SC_D SC_Q SC_E
+
+
+6. TIMING
+------------------------------------------------------------------
+  sys_ticks()     milliseconds since boot
+  sys_sleep(ms)   give up the CPU for ms
+
+A fixed delay makes speed depend on the machine. Measure instead:
+
+  int last = sys_ticks();
+  while (running) {
+      int now = sys_ticks();
+      int dt  = now - last;
+      last = now;
+      x = x + vx * dt / 1000;       /* pixels per second */
+      draw();
+      sys_sleep(16);                /* ~60 fps */
+  }
+
+
+7. A COMPLETE PROGRAM
+------------------------------------------------------------------
+  #include <stdio.h>
+  #include <gfx.h>
+
+  int main() {
+      gfx_fbinfo_t fb;
+      if (gfx_fbinfo(&fb) < 0) { puts("no framebuffer\n"); return 1; }
+      char *screen = (char *)fb.user_addr;
+
+      int x = 100, y = 100;
+      while (1) {
+          if (sys_getkey_nb() == 27) break;
+          if (sys_keystate(SC_LEFT))  x = x - 4;
+          if (sys_keystate(SC_RIGHT)) x = x + 4;
+          if (sys_keystate(SC_UP))    y = y - 4;
+          if (sys_keystate(SC_DOWN))  y = y + 4;
+          if (x < 0) x = 0;
+          if (y < 0) y = 0;
+          if (x > fb.w - 40) x = fb.w - 40;
+          if (y > fb.h - 40) y = fb.h - 40;
+
+          for (int r = 0; r < fb.h; r++) {
+              int *p = (int *)(screen + r * fb.pitch);
+              for (int c = 0; c < fb.w; c++) p[c] = 0;
+          }
+          for (int r = y; r < y + 40; r++) {
+              int *p = (int *)(screen + r * fb.pitch);
+              for (int c = x; c < x + 40; c++) p[c] = 0x00FF00;
+          }
+          sys_sleep(16);
+      }
+      gfx_mode(GFX_MODE_TEXT);
+      return 0;
+  }
+
+  cc
+  source files: box.c gfx.c
+  output file:  box
+
+
+8. THINGS THAT WILL BITE YOU
+------------------------------------------------------------------
+- Forgetting gfx_mode(GFX_MODE_TEXT) before returning. The shell is
+  still running, you just cannot see it. Reboot to recover.
+- Using w instead of pitch. See section 2.
+- Clearing the whole screen every frame is slow at 1440x900. Redraw
+  only what moved: erase the old rectangle, draw the new one.
+- Reading back from the framebuffer is far slower than writing it.
+  Keep your own copy of any state you need to read.
+- 8-bpp gives you 256 colours and nothing is set up by default --
+  call gfx_set_palette for every index you use.
+- demo/move.c is a longer worked example. type demo/move.c

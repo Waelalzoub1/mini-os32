@@ -9,3 +9,9 @@ tools/cc_host
 *.img
 *.vdi
 *.pad
+tools/__pycache__/
+tools/host/hostcc
+tools/host/hostcc0
+tools/host/loader32
+tools/host/runner
+fs/src/cc.c

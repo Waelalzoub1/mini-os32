@@ -1,9 +1,35 @@
 #!/usr/bin/env python3
+"""Pack the fs/ tree into the flat mini-os32 filesystem image.
+
+The OS filesystem is flat: "lib/stdio.c" is one literal 15-char key.  Host
+subdirectories under fs/ become name prefixes, and each subdirectory also
+gets a zero-size marker entry with a trailing slash ("lib/"), which is what
+the shell's cd/ls recognise as a directory.
+"""
 import os
 import struct
 import sys
 
-ENTRY_SIZE = 32
+ENTRY_SIZE = 64
+NAME_MAX = 47
+
+
+def collect(fsdir):
+    """Return [(key, path-or-None)] — None marks a directory entry."""
+    items = []
+    for root, dirs, files in os.walk(fsdir):
+        dirs.sort()
+        rel = os.path.relpath(root, fsdir)
+        prefix = '' if rel == '.' else rel.replace(os.sep, '/') + '/'
+        if prefix:
+            items.append((prefix, None))
+        for name in sorted(files):
+            items.append((prefix + name, os.path.join(root, name)))
+    for key, _ in items:
+        if len(key) > NAME_MAX:
+            sys.exit("mkfs: name too long for the 15-char FS limit: %r" % key)
+    items.sort(key=lambda kv: kv[0])
+    return items
 
 
 def main():
@@ -20,22 +46,26 @@ def main():
     directory = bytearray(dir_size)
     data = bytearray()
 
-    files = [f for f in sorted(os.listdir(fsdir)) if os.path.isfile(os.path.join(fsdir, f))]
+    items = collect(fsdir)
+    if len(items) > entries:
+        sys.exit("mkfs: %d entries but the directory holds %d" % (len(items), entries))
     cur_lba = data_lba
 
-    for i, name in enumerate(files[:entries]):
-        path = os.path.join(fsdir, name)
-        with open(path, 'rb') as f:
-            blob = f.read()
+    for i, (key, path) in enumerate(items):
+        if path is None:
+            blob = b''
+        else:
+            with open(path, 'rb') as f:
+                blob = f.read()
         size = len(blob)
         sectors = (size + 511) // 512
 
         entry = bytearray(ENTRY_SIZE)
-        enc = name.encode('ascii', 'ignore')[:15]
+        enc = key.encode('ascii', 'ignore')[:NAME_MAX]
         entry[0:len(enc)] = enc
-        struct.pack_into('<I', entry, 16, cur_lba)
-        struct.pack_into('<I', entry, 20, size)
-        struct.pack_into('<I', entry, 24, 0)
+        struct.pack_into('<I', entry, 48, cur_lba)
+        struct.pack_into('<I', entry, 52, size)
+        struct.pack_into('<I', entry, 56, 0)
 
         directory[i * ENTRY_SIZE:(i + 1) * ENTRY_SIZE] = entry
 

@@ -33,10 +33,19 @@ enum {
     SYS_SLEEPF = 28,
     SYS_GFX_FBINFO = 29,
     SYS_KEYSTATE = 30,
-    SYS_UDP_SEND    = 31,
-    SYS_UDP_RECV    = 32,
-    SYS_NET_IP      = 33,
-    SYS_UDP_RECV_NB = 34
+    SYS_GETCWD      = 35,
+    SYS_SETCWD      = 36,
+    SYS_POWEROFF    = 37,
+    SYS_MEMINFO     = 38,
+    SYS_STORAGE     = 39,
+    SYS_SYNC        = 40,
+    SYS_IO_IN       = 41,
+    SYS_IO_OUT      = 42,
+    SYS_PCI_READ    = 43,
+    SYS_PCI_WRITE   = 44,
+    SYS_MAP_PHYS    = 45,
+    SYS_DMA_ALLOC   = 46,
+    SYS_IRQ_WAIT    = 47
 };
 
 int sys_write(int fd, const void *buf, int len);
@@ -70,10 +79,38 @@ int sys_gfxinfo(void *buf, int max);
 int sys_vbemodes(void *buf, int max);
 void sys_exit(int code) __attribute__((noreturn));
 void *sys_sbrk(int inc);
-int sys_udp_send(int dst_ip, int dst_port, void *buf, int len);
-int sys_udp_recv(int my_port, void *buf, int maxlen, int *src_ip);
-int sys_udp_recv_nb(int my_port, void *buf, int maxlen, int *src_ip);
-int sys_net_myip(void);
+int sys_getcwd(char *buf, int max);
+int sys_setcwd(const char *path);
+void sys_poweroff(void);
+int sys_meminfo(void *buf, int max);
+int sys_storage(void *buf, int max);
+int sys_sync(void);
+
+/* Hardware access for user-space drivers.  bdf packs bus<<16|dev<<8|fn.
+ * sys_map_phys returns a user pointer (as an offset) to `size` bytes of the
+ * device's registers, mapped uncached; -1 on failure.  sys_dma_alloc fills
+ * out[0] with the user pointer and out[1] with the physical address a device
+ * must be programmed with.  sys_irq_wait unmasks the line and blocks until
+ * its count moves; returns the delta, or 0 on timeout. */
+int sys_io_in(int port, int width);
+int sys_io_out(int port, int width, int value);
+int sys_pci_read(int bdf, int off);
+int sys_pci_write(int bdf, int off, int value);
+int sys_map_phys(unsigned phys_lo, unsigned phys_hi, int size);
+int sys_dma_alloc(int size, unsigned out[2]);
+int sys_irq_wait(int irq, int timeout_ms);
+
+/* Path handling.  The filesystem is flat -- "src/main.c" is one literal key --
+ * so a relative name only means something once joined to a base directory.
+ * The base is the shell's cwd, published via sys_setcwd on `cd`. */
+#define PATH_MAX_LEN 64
+#define FS_NAME_MAX  47   /* longer keys are silently truncated by the kernel */
+
+const char *cwd_get(void);
+int   path_resolve(const char *base, const char *name, char *out, int outsz);
+int   path_fs(const char *base, const char *name, char *out, int outsz);
+void  path_dir(const char *path, char *out, int outsz);
+const char *path_base(const char *path);
 
 int puts(const char *s);
 int putc(char c);

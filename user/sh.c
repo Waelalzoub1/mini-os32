@@ -1,6 +1,6 @@
 #include "libc.h"
 
-#define NAME_MAX 15
+#define NAME_MAX 47
 
 static char cwd[64] = "";
 
@@ -44,9 +44,9 @@ static int find_slash(const char *s) {
 }
 
 static void entry_name(char *out, const char *buf, int idx) {
-    const char *p = buf + idx * 20;
+    const char *p = buf + idx * 52;
     int i = 0;
-    while (i < 16 && p[i]) { out[i] = p[i]; i++; }
+    while (i < 48 && p[i]) { out[i] = p[i]; i++; }
     out[i] = 0;
 }
 
@@ -97,80 +97,94 @@ static int build_path(const char *arg, char *out, int outsz, int want_dir) {
     return 1;
 }
 
+/* Shared listing buffer, sized for a full directory: with 512 entries the
+ * old 64-entry stack buffers silently truncated ls and cd. */
+static char list_buf[52 * 512];
+
 static int dir_exists(const char *path) {
-    char buf[20 * 64];
-    int n = sys_list(buf, sizeof(buf));
-    char name[17];
+    int n = sys_list(list_buf, sizeof(list_buf));
+    char name[49];
     for (int i = 0; i < n; i++) {
-        entry_name(name, buf, i);
+        entry_name(name, list_buf, i);
         if (name_eq_ci(name, path)) return 1;
     }
     return 0;
 }
 
 static int dir_has_children(const char *path) {
-    char buf[20 * 64];
-    int n = sys_list(buf, sizeof(buf));
-    char name[17];
+    int n = sys_list(list_buf, sizeof(list_buf));
+    char name[49];
     for (int i = 0; i < n; i++) {
-        entry_name(name, buf, i);
+        entry_name(name, list_buf, i);
         if (starts_with_ci(name, path) && !name_eq_ci(name, path)) return 1;
     }
     return 0;
 }
 
-static void cmd_ls(void) {
-    char buf[20 * 64];
-    int n = sys_list(buf, sizeof(buf));
-    for (int i = 0; i < n; i++) {
-        char name[17];
-        entry_name(name, buf, i);
-        if (name[0] == 0) continue;
+/* Is `name` visible in the current directory?  Fills disp (the name shown,
+ * without the cwd prefix) and is_dir (entry is an immediate subdirectory). */
+static int ls_visible(const char *name, char *disp, int *is_dir) {
+    const char *rest = name;
+    if (cwd[0] != 0) {
+        if (!starts_with_ci(name, cwd)) return 0;
+        rest = name + strlen(cwd);
+        if (*rest == 0) return 0;
+    }
+    int s = find_slash(rest);
+    if (s < 0) {
+        strcpy(disp, rest);
+        *is_dir = 0;
+        return 1;
+    }
+    if (rest[s + 1] == 0) {
+        memcpy(disp, rest, s);
+        disp[s] = 0;
+        *is_dir = 1;
+        return 1;
+    }
+    return 0;
+}
 
-        int show = 0;
-        int is_dir = 0;
-        char disp[17];
+/* One ls cell: "name/ " for dirs, "name size" for files, padded into
+ * 26-char columns, three per line. */
+#define LS_COLS 3
+#define LS_COL_W 26
 
-        if (cwd[0] == 0) {
-            int s = find_slash(name);
-            if (s < 0) {
-                show = 1;
-                strcpy(disp, name);
-            } else if (name[s + 1] == 0) {
-                show = 1;
-                is_dir = 1;
-                memcpy(disp, name, s);
-                disp[s] = 0;
-            }
-        } else {
-            if (!starts_with_ci(name, cwd)) continue;
-            int prefix_len = strlen(cwd);
-            const char *rest = name + prefix_len;
-            if (*rest == 0) continue;
-            int s = find_slash(rest);
-            if (s < 0) {
-                show = 1;
-                strcpy(disp, rest);
-            } else if (rest[s + 1] == 0) {
-                show = 1;
-                is_dir = 1;
-                memcpy(disp, rest, s);
-                disp[s] = 0;
-            }
-        }
-
-        if (!show) continue;
-        int size = *(int*)(buf + i * 20 + 16);
-        puts(disp);
-        if (is_dir) puts("/");
-        puts(" ");
+static void ls_print(const char *disp, int is_dir, int size, int *col) {
+    int w = strlen(disp);
+    puts(disp);
+    if (is_dir) { puts("/"); w++; }
+    else {
+        putc(' '); w++;
         char num[12];
         int v = size; int j = 0;
         if (v == 0) { num[j++] = '0'; }
         while (v > 0 && j < 10) { num[j++] = '0' + (v % 10); v /= 10; }
-        for (int k = j - 1; k >= 0; k--) putc(num[k]);
-        puts("\n");
+        for (int k = j - 1; k >= 0; k--) { putc(num[k]); w++; }
     }
+    (*col)++;
+    if (*col >= LS_COLS) { puts("\n"); *col = 0; }
+    else while (w < LS_COL_W) { putc(' '); w++; }
+}
+
+static void cmd_ls(void) {
+    int n = sys_list(list_buf, sizeof(list_buf));
+    int col = 0;
+    /* two passes: directories first, then files */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < n; i++) {
+            char name[49];
+            entry_name(name, list_buf, i);
+            if (name[0] == 0) continue;
+            char disp[49];
+            int is_dir = 0;
+            if (!ls_visible(name, disp, &is_dir)) continue;
+            if ((pass == 0) != (is_dir != 0)) continue;
+            int size = *(int*)(list_buf + i * 52 + 48);
+            ls_print(disp, is_dir, size, &col);
+        }
+    }
+    if (col) puts("\n");
 }
 
 static void cmd_type(const char *name) {
@@ -405,7 +419,12 @@ static void cmd_edit(const char *name) {
             return;
         } else if (key == 19) { /* Ctrl+S */
             if (sys_save(path, buf, len) != 0) status = "save fail";
-            else { dirty = 0; status = "saved"; }
+            else {
+                dirty = 0;
+                /* flush to the persistent store too: work typed into the
+                   editor should survive losing the VM or the power */
+                status = sys_sync() == 0 ? "saved+synced" : "saved (no store)";
+            }
             need_redraw = 1;
             continue;
         } else if (key == 21) { /* Ctrl+U: page up */
@@ -467,14 +486,21 @@ static void cmd_edit(const char *name) {
     }
 }
 
+/* Publish the cwd to the kernel so launched programs (cc) resolve relative
+ * names against the same directory the prompt shows. */
+static void set_cwd(const char *path) {
+    strcpy(cwd, path);
+    sys_setcwd(cwd);
+}
+
 static void cmd_cd(const char *arg) {
     char path[64];
     int ok = build_path(arg, path, sizeof(path), 1);
     if (ok <= 0) { puts("cd <dir>\n"); return; }
     if (strlen(path) > NAME_MAX) { puts("name too long\n"); return; }
-    if (path[0] == 0) { cwd[0] = 0; return; }
+    if (path[0] == 0) { set_cwd(""); return; }
     if (!dir_exists(path)) { puts("no such dir\n"); return; }
-    strcpy(cwd, path);
+    set_cwd(path);
 }
 
 static void cmd_mkdir(const char *arg) {
@@ -512,11 +538,15 @@ static void cmd_rmdir(const char *arg) {
 }
 
 static void help(void) {
-    puts("ls type edit run mv rm mkdir rmdir cd cc help\n");
+    puts("ls type edit run mv rm mkdir rmdir cd cc as sync shutdown help\n");
 }
 
 int main(void) {
     char line[128];
+    /* `run` replaces the shell process, and a fresh shell starts here when
+       the program exits.  The kernel remembers the cwd the previous shell
+       published on `cd`, so read it back rather than resetting to root. */
+    if (sys_getcwd(cwd, sizeof(cwd)) < 0) set_cwd("");
     for (;;) {
         prompt();
         int n = readline(line, sizeof(line));
@@ -572,6 +602,14 @@ int main(void) {
             if (*arg) cmd_cd(arg); else cmd_cd("/");
         } else if (!strncmp(cmd, "cc", 2) && (cmd[2] == 0 || cmd[2] == ' ')) {
             cmd_run("/cc");
+        } else if (!strncmp(cmd, "as", 2) && (cmd[2] == 0 || cmd[2] == ' ')) {
+            cmd_run("/as");
+        } else if (!strncmp(cmd, "sync", 4) && (cmd[4] == 0 || cmd[4] == ' ')) {
+            if (sys_sync() != 0) puts("no persistent store\n");
+            else puts("synced\n");
+        } else if (!strncmp(cmd, "shutdown", 8) || !strncmp(cmd, "poweroff", 8)) {
+            puts("shutting down\n");
+            sys_poweroff();
         } else if (!strncmp(cmd, "help", 4)) {
             help();
         } else {

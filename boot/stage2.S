@@ -5,6 +5,8 @@
 .equ VBE_INFO_OFF, 0x0000
 .equ MODE_INFO_OFF, 0x0200
 .equ BOOTINFO_ADDR, 0x5000
+/* must match sizeof(bootinfo_t) in kernel/bootinfo.h */
+.equ BOOTINFO_SIZE, 72
 .equ FONT_ADDR, 0x6000
 .equ VBE_LIST_ADDR, 0x7000
 .equ VBE_LIST_MAX, 128
@@ -367,9 +369,18 @@ maybe_set_mode:
     mov %ax, %ds
 
 write_bootinfo:
-    /* write bootinfo */
+    /* Zero the whole struct before filling it.  Fields this loader knows
+     * nothing about -- lfb_high, added for UEFI framebuffers above 4GB --
+     * would otherwise be whatever stale memory sat at 0x5000, and a bogus
+     * lfb_high sends the kernel off mapping a garbage physical address. */
     xor %ax, %ax
     mov %ax, %es
+    mov $BOOTINFO_ADDR, %di
+    mov $BOOTINFO_SIZE, %cx
+    cld
+    rep stosb
+
+    /* write bootinfo */
     mov $BOOTINFO_ADDR, %di
     movw $0x3332, %es:(%di)  /* "23" */
     movw $0x4F53, %es:2(%di)  /* "SO" */
