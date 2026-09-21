@@ -44,7 +44,16 @@ user space: shell (ls, type, edit, run, mv, rm, mkdir, rmdir, cd, cc, as, sync, 
 
 ## Build and boot
 
-Requirements: gcc with 32-bit support (`gcc-multilib` on Debian/Ubuntu), binutils, python3, `qemu-system-x86`. For the UEFI image also the OVMF/edk2 firmware. For the host-side tests: Icarus is not needed; the `unicorn` Python package is used by `tools/osrun.py`.
+Requirements: gcc with 32-bit support, binutils, python3, QEMU, and for the host-mode tests the `unicorn` Python package (used by `tools/osrun.py`). For the UEFI image also the OVMF/edk2 firmware.
+
+```bash
+# Debian / Ubuntu
+sudo apt install build-essential gcc-multilib python3 python3-pip qemu-system-x86 ovmf
+pip install unicorn
+# Arch
+sudo pacman -S base-devel lib32-glibc lib32-gcc-libs python python-pip qemu-system-x86 edk2-ovmf
+pip install unicorn
+```
 
 ```bash
 ./build.sh                          # build/disk.img (BIOS) and build/minios-uefi.img (UEFI)
