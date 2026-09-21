@@ -15,3 +15,4 @@ tools/host/hostcc0
 tools/host/loader32
 tools/host/runner
 fs/src/cc.c
+fs/as
