@@ -241,8 +241,9 @@ object file: there is no linker in the OS, so an assembly program is entirely
 self-contained and cannot be linked against `cc` output.
 
 ```
-as            source file: demo/hello.s
-              output file: hello
+as
+source file: demo/hello.s
+output file: hello
 run hello
 ```
 
