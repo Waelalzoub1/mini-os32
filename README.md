@@ -15,7 +15,7 @@ Part of a "transistors to transformers" body of work. See also [custom-16bit-CPU
 | Kernel: paging, IDT/ISRs, PIT, keyboard, framebuffer console, flat filesystem, syscalls, threads, NVMe driver, PCI/IO/DMA/IRQ syscalls | `kernel/` | 3,365 |
 | User C library and crt0 (for gcc-built programs) | `user/libc.c`, `user/libc.h`, `user/crt0.S` | 616 |
 | Shell | `user/sh.c` | 558 |
-| **C compiler** (preprocessor, single-pass parser and x86 code generator, linker, ELF writer) | `user/cc.c` | 4,311 |
+| **C compiler** (preprocessor, parser and direct x86 code generator, linker, ELF writer) | `user/cc.c` | 4,311 |
 | Assembler (x86-32, AT&T syntax) | `user/as.c` | 831 |
 | In-OS C library compiled by `cc` (stdio, stdlib, string, gfx, path) | `fs/lib/` | 1,104 |
 | In-OS programs (hardware self-test, lspci, demos) | `fs/hw/`, `fs/demo/`, `fs/guess.c` | 595 |
@@ -34,11 +34,12 @@ UEFI path:  BOOTX64.EFI (uefi.c: GOP framebuffer, load kernel.bin + fs.bin from 
 kernel.c:   paging (kernel identity map + a 96 MB user address space based at 4 MB) -> IDT, PIC, PIT (100 Hz), keyboard
             -> framebuffer text console (8x16 font, 512-line scrollback) -> flat filesystem (512 entries, 47-char names,
             RAM disk synced to an NVMe store partition on UEFI) -> syscall_entry (int 0x80, eax = number, ebx/ecx/edx/esi = args)
-            -> ELF loader -> user programs run in ring 3, one at a time; a program may start up to 8 threads, scheduled round-robin on the timer tick
+            -> ELF loader -> user programs run in ring 3, one at a time; a program may have up to 8 threads including its main thread, scheduled round-robin on the timer tick
 
 user space: shell (ls, type, edit, run, mv, rm, mkdir, rmdir, cd, cc, as, sync, shutdown, help)
-            -> cc: preprocessor -> tokenizer -> single-pass recursive-descent parser that emits x86 machine code
-                   directly (stack machine, x87 for float) -> per-object relocation tables -> linker -> ELF
+            -> cc: preprocessor -> tokenizer -> recursive-descent parser: statements are compiled in a single pass,
+                   each expression via a small per-expression tree, straight to x86 machine code (stack machine,
+                   x87 for float) -> per-object relocation tables -> linker -> ELF
             -> programs compiled in-OS link against fs/lib (stdio is added automatically)
 ```
 
@@ -80,19 +81,19 @@ run hello
 
 Every item below is covered by a program in `tests/` that is compiled by `cc` and executed, in host mode and inside the OS under QEMU, and its output compared with the expected text. `./test.sh` reruns all of it.
 
-**Supported (51 test programs: 45 compile-and-run, 6 must-reject; all pass in both modes)**
+**Supported (52 test programs: 46 compile-and-run, 6 must-reject; all pass in both modes)**
 
 - Types: `int`, `unsigned`, `char`, `unsigned char`, `short` (16-bit), `long` (32-bit, same as `int`), `float` (x87), `bool`/`_Bool`, `void`, pointers and pointers to pointers, arrays including multi-dimensional, `struct` (nested, arrays of structs, forward `typedef struct T T;`), `union`, `enum`, `typedef`; `static`, `extern`, `const`, `volatile`.
 - Literals: decimal and hex (no binary literals); `u`/`U`/`l`/`L` suffixes; char and string literals with `\n \t \\ \" \' \0` escapes.
 - Operators: `+ - * / %`, `& | ^ ~ << >>`, comparisons, `&& || !` with short-circuit, `=` and all compound assignments, `++`/`--` prefix and postfix, `?:`, `sizeof` on types and expressions, casts, `& *`, `.` and `->`, array indexing, pointer arithmetic, function pointers.
 - Statements: blocks, `if`/`else`, `while`, `do`/`while`, `for` with expression or declaration initializer, `switch`/`case`/`default` with fallthrough, `break`, `continue`, `goto`, `return`, declarations anywhere in a block.
 - Functions: up to 16 parameters, recursion, prototypes, varargs via `va_start`/`va_arg`/`va_end` builtins, calls across translation units, `extern` globals.
-- Data: global and local initializers for scalars, arrays, and structs; whole-struct assignment.
+- Data: global and local initializers for scalars, arrays, and structs; whole-struct assignment; passing a struct to a function by value.
 - Preprocessor: `#include "..."` and `<...>`, `#define` constants and function-like macros (up to 8 parameters), `#undef`, `#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`/`#endif`, `__LINE__`, `__FILE__`.
 
 **Not supported (rejected with an error; each has a must-reject test)**
 
-- bitfields, `double` (and 64-bit integers), passing or returning a struct by value, adjacent string literal concatenation (`"a" "b"`), compound literals (`(struct T){...}`), the comma operator.
+- bitfields, `double` (and 64-bit integers), returning a struct by value, adjacent string literal concatenation (`"a" "b"`), compound literals (`(struct T){...}`), the comma operator.
 - Also: token pasting and stringizing in macros; block comments that open on a `#define` line (the preprocessor is line based).
 
 Argument evaluation order is right to left, which C allows but code should not rely on.
@@ -131,7 +132,7 @@ output file: cc3
 ## Tests
 
 ```bash
-./test.sh            # build, run the 51-program compiler suite in host mode, run the native self-hosting check
+./test.sh            # build, run the 52-program compiler suite in host mode, run the native self-hosting check
 ./test.sh --qemu     # the same plus the suite and the self-hosting chain inside QEMU
 python3 tests/run_tests.py [--qemu] [--markdown] [name...]
 ```
@@ -316,8 +317,9 @@ is excluded. Nothing outside one partition is reachable from this kernel --
 verified by diffing the QEMU image before and after a session and confirming
 every changed sector fell in the store's data window.
 
-Writes are write-through, so a power cut loses at most the sector in flight
-rather than the session. `sync` rewrites the whole image and is a way to check
+Writes are write-through: each changed sector is sent to the store as it changes, so a
+crash of the OS loses little. The driver does not issue an NVMe Flush or check the drive's
+volatile write cache, so a power cut can still lose sectors the drive had not yet committed. `sync` rewrites the whole image and is a way to check
 the store is still reachable.
 
 **Setting it up on real hardware.** You need a spare partition; ~16MB is
@@ -377,7 +379,7 @@ Directories are simulated by file names with `/` in them (the FS is flat interna
 - Max identifier length: 31 chars; function args: 16; struct fields: 64
 - File name length in the filesystem: 47 chars; directory: 512 entries
 - Per object: code 384 KB, rodata 96 KB, data 32 KB; BSS 20 MB; output ELF 1 MB
-- Parse nodes: 4096 per translation unit, labels 8192, symbols 1024, functions 512
+- Parse nodes: 4096 per top-level declaration (the pool resets between them), labels 8192, symbols 1024, functions 512
 
 These are sized so that `cc.c` (4,311 lines) compiles in-OS; `cc.elf` itself has an 18.5 MB `.bss` against a ~23 MB user arena.
 
